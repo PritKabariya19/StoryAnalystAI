@@ -112,11 +112,15 @@ function buildCard(tc, idx) {
   const stepItems = (tc.steps || []).map(s => `<li>${esc(s)}</li>`).join("");
   card.innerHTML = `
     <div class="tc-card-header" onclick="toggleCard(${idx})">
-      <span class="tc-id">${esc(tc.id)}</span>
-      <span class="tc-title">${esc(tc.title)}</span>
-      <span class="tc-badge ${badgeMap[tc.type] || ""}">${esc(tc.type)}</span>
-      <span class="tc-priority-badge prio-${esc(tc.priority)}">${esc(tc.priority)}</span>
-      <span class="tc-chevron">▼</span>
+      <div class="tc-row-main">
+          <span class="tc-id">${esc(tc.id)}</span>
+          <span class="tc-title">${esc(tc.title)}</span>
+          <span class="tc-chevron">▼</span>
+      </div>
+      <div class="tc-row-meta">
+          <span class="tc-badge ${badgeMap[tc.type] || ""}">${esc(tc.type)}</span>
+          <span class="tc-priority-badge prio-${esc(tc.priority)}">${esc(tc.priority)}</span>
+      </div>
     </div>
     <div class="tc-card-body">
       ${precItems ? `<div class="tc-section"><h4>Preconditions</h4><ul>${precItems}</ul></div>` : ""}
@@ -248,9 +252,13 @@ function buildPageBlock(page) {
 
   div.innerHTML = `
     <div class="page-block-header">
-      <span class="page-title-text">${esc(page.title || "Page")}</span>
-      <span class="page-url">${esc(page.url)}</span>
-      ${page.error ? `<span style="color:#fca5a5;font-size:.78rem">⚠️ ${esc(page.error)}</span>` : ""}
+      <div class="tc-row-main">
+          <span class="page-title-text">${esc(page.title || "Page")}</span>
+          ${page.error ? `<span style="color:#fca5a5;font-size:.78rem">⚠️ ${esc(page.error)}</span>` : ""}
+      </div>
+      <div class="tc-row-meta" style="padding-left: 0;">
+          <span class="page-url">${esc(page.url)}</span>
+      </div>
     </div>
     <div class="page-block-body">
       <div>${formsHtml}</div>
@@ -333,12 +341,16 @@ function buildCombinedCard(tc, idx) {
   card.id = `ctc-${idx}`;
   card.innerHTML = `
     <div class="ctc-card-header" onclick="toggleCombinedCard(${idx})">
-      <span class="ctc-id">${esc(tc.tc_id)}</span>
-      <span class="ctc-condition">${esc(tc.condition)}</span>
-      <span class="tc-badge ${badgeMap[tc.type] || ""}">` + esc(tc.type) + `</span>
-      <span class="tc-priority-badge prio-${esc(tc.priority)}">${esc(tc.priority)}</span>
-      ${tc.mapped ? '<span class="mapped-badge">✅ Mapped</span>' : '<span class="unmapped-badge">⚠️ Unmapped</span>'}
-      <span class="tc-chevron">▼</span>
+      <div class="tc-row-main">
+          <span class="ctc-id">${esc(tc.tc_id)}</span>
+          <span class="ctc-condition">${esc(tc.condition)}</span>
+          <span class="tc-chevron">▼</span>
+      </div>
+      <div class="tc-row-meta">
+          <span class="tc-badge ${badgeMap[tc.type] || ""}">` + esc(tc.type) + `</span>
+          <span class="tc-priority-badge prio-${esc(tc.priority)}">${esc(tc.priority)}</span>
+          ${tc.mapped ? '<span class="mapped-badge">✅ Mapped</span>' : '<span class="unmapped-badge">⚠️ Unmapped</span>'}
+      </div>
     </div>
     <div class="ctc-body">
       <div class="steps-col">

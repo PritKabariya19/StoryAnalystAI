@@ -17,8 +17,8 @@ if _env_path.exists():
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL:   str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "AIzaSyCI6cSwEtJjEl60E8CySIjHdhDU04yuAOM")
+GEMINI_MODEL:   str = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 if not GEMINI_API_KEY:
     raise EnvironmentError(

@@ -15,6 +15,9 @@
 
     <header class="header">
         <div class="header-inner">
+            <div style="position: absolute; right: 0; top: 0;">
+                <a href="/logout" style="color: var(--accent); text-decoration: none; font-size: 0.9rem; padding: 0.5rem 1rem; border: 1px solid var(--accent); border-radius: 8px;">Logout</a>
+            </div>
             <div class="logo">
                 <span class="logo-icon">⚡</span>
                 <span class="logo-text">StoryAnalyst <span class="logo-sub">AI</span></span>
@@ -37,6 +40,7 @@
 
 
         <!-- ── USER STORY PANEL ── -->
+        <div class="panels-wrapper">
         <section class="card input-card" id="panel-story">
             <h2 class="card-title">📝 Enter Your User Story</h2>
             <p class="card-subtitle">Paste any user story. AI agents extract conditions and generate all test cases.</p>
@@ -293,8 +297,7 @@
                 <div class="explorer-header">
                     <h2 class="card-title">🗺️ Website Structure</h2>
                     <div class="explorer-meta" id="explorer-meta"></div>
-                    <button class="btn btn-secondary" onclick="exportExplorerJSON()" style="margin-left:auto">⬇️ Export
-                        JSON</button>
+                    <button class="btn btn-secondary" onclick="exportExplorerJSON()">⬇️ Export JSON</button>
                 </div>
                 <div id="explorer-pages"></div>
             </div>
@@ -306,7 +309,7 @@
                 <div class="explorer-header">
                     <h2 class="card-title">⚡ Combined Test Cases</h2>
                     <div id="combined-meta" class="explorer-meta"></div>
-                    <div style="margin-left:auto;display:flex;gap:.6rem">
+                    <div style="display:flex;gap:.6rem">
                         <button class="btn btn-secondary" onclick="exportCombinedJSON()">⬇️ Export JSON</button>
                         <button class="btn btn-secondary" onclick="exportCombinedCSV()">📄 Export CSV</button>
                     </div>
@@ -327,6 +330,7 @@
                 <div id="combined-container"></div>
             </div>
         </section>
+        </div>
 
     </main>
 

@@ -12,15 +12,27 @@ Routes:
   GET  /screenshots/<f>   → serve screenshot files
 """
 
-from flask import Flask, render_template, request, jsonify, send_from_directory, Response
+from flask import Flask, render_template, request, jsonify, send_from_directory, Response, redirect, url_for, session
 from orchestrator import Orchestrator
 from agents.website_explorer import WebsiteExplorerAgent
 from agents.combined_generator import CombinedGeneratorAgent
 from agents.test_executor import TestExecutorAgent
 from agents.report_agent import ReportAgent
 import os
+import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app        = Flask(__name__, template_folder="ui/templates", static_folder="ui/static")
+app.secret_key = "super_secret_story_analyst_key" # Needed for session management
+
+def init_db():
+    conn = sqlite3.connect("users.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT UNIQUE, password TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
 orchestrator = Orchestrator()
 explorer     = WebsiteExplorerAgent()
 combiner     = CombinedGeneratorAgent()
@@ -32,7 +44,53 @@ _last_report_html: str = ""  # cache latest report for /report/download
 
 @app.route("/")
 def index():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
     return render_template("index.html")
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    if request.method == "POST":
+        name = request.form.get("name")
+        email = request.form.get("email")
+        password = request.form.get("password")
+        if not name or not email or not password:
+            return render_template("signup.html", error="All fields are required.")
+        hashed_pw = generate_password_hash(password)
+        try:
+            conn = sqlite3.connect("users.db")
+            c = conn.cursor()
+            c.execute("INSERT INTO users (name, email, password) VALUES (?, ?, ?)", (name, email, hashed_pw))
+            conn.commit()
+            conn.close()
+            return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            return render_template("signup.html", error="Email already exists. Please login.")
+    return render_template("signup.html")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email")
+        password = request.form.get("password")
+        conn = sqlite3.connect("users.db")
+        c = conn.cursor()
+        c.execute("SELECT id, name, password FROM users WHERE email=?", (email,))
+        user = c.fetchone()
+        conn.close()
+        
+        if user and check_password_hash(user[2], password):
+            session["user_id"] = user[0]
+            session["user_name"] = user[1]
+            return redirect(url_for("index"))
+        else:
+            return render_template("login.html", error="Invalid email or password.")
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.route("/analyze", methods=["POST"])
