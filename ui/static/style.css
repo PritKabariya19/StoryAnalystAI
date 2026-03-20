@@ -1530,3 +1530,30 @@ body {
     background: rgba(255,255,255,0.05) !important;
     border-radius: 50% !important;
 }
+
+/* ── Screenshot thumbnail in execution results table ── */
+.exec-shot-link {
+    display: inline-block;
+    line-height: 0;
+}
+
+.exec-shot-thumb {
+    max-width: 120px;
+    max-height: 80px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    cursor: pointer;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    display: block;
+}
+
+.exec-shot-thumb:hover {
+    transform: scale(1.05);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.exec-shot-fallback {
+    font-size: .8rem;
+    color: #f59e0b;
+}

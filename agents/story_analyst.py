@@ -37,15 +37,18 @@ Given a user story, return a JSON object with exactly these keys:
   ]
 }
 
-The "conditions" list must be COMPREHENSIVE and include ALL of:
-  1. Valid / happy-path scenarios
-  2. Invalid input scenarios (wrong format, wrong values)
-  3. Missing / empty field scenarios (one at a time for each required field)
-  4. Boundary conditions (min value, max value, exactly at limits)
-  5. Edge cases (special characters, SQL injection, XSS, whitespace-only, very long strings)
-  6. Security scenarios (unauthorized access, session expiry, locked accounts)
-  7. Error message / validation rule scenarios
-  8. Any domain-specific conditions implied by the story
+The "conditions" list must be ABSOLUTELY EXHAUSTIVE and MASSIVE. Generate AS MANY test conditions as humanly and technically possible for this feature (aim for 50 to 200 conditions if applicable).
+Think of EVERY possible permutation of inputs, edge cases, negative flows, boundary values, security bypass attempts, concurrent sessions, and complex state changes.
+
+Ensure you include ALL of:
+  1. Valid / happy-path scenarios (all variations)
+  2. Invalid input scenarios (wrong format, wrong characters, regex bypass)
+  3. Missing / empty field scenarios (single missing, multiple missing, all missing)
+  4. Boundary conditions (min length-1, min length, max length, max length+1)
+  5. Edge cases (special characters, SQL injection, Cross-Site Scripting (XSS), whitespace-only, emoji overloading, very long strings)
+  6. Security scenarios (unauthorized access, session expiry, locked accounts, CSRF tokens, rate limiting)
+  7. Error message / validation rule scenarios for every single possible failure
+  8. Any domain-specific conditions implied by the story, including temporal and stateful variations
 
 Rules:
 - Do NOT invent features not mentioned in the story.

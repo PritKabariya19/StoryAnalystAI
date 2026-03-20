@@ -503,8 +503,13 @@ function buildExecRow(r) {
   const tr = document.createElement("tr");
   const stCls = r.status === "Pass" ? "exec-status-pass" :
     r.status === "Fail" ? "exec-status-fail" : "exec-status-error";
-  const shotCell = r.screenshot_path
-    ? `<a href="/${esc(r.screenshot_path)}" target="_blank" class="exec-shot-link">View 📸</a>`
+  const shotPath = r.screenshot_path ? `/${esc(r.screenshot_path)}` : null;
+  const shotCell = shotPath
+    ? `<a href="${shotPath}" target="_blank" class="exec-shot-link" title="Click to view full screenshot">
+         <img src="${shotPath}" alt="Failure screenshot" class="exec-shot-thumb"
+              onerror="this.style.display='none';this.nextElementSibling.style.display='inline-block'">
+         <span class="exec-shot-fallback" style="display:none">View 📸</span>
+       </a>`
     : `<span style="color:var(--text-muted);font-size:.75rem">—</span>`;
   tr.innerHTML = `
     <td style="font-family:monospace;font-size:.78rem;white-space:nowrap">${esc(r.tc_id)}</td>
