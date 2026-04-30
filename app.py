@@ -1,100 +1,65 @@
 """
-Flask Web Application
-----------------------
+Flask Microservice — AI Backend
+--------------------------------
+Pure JSON API microservice called by the Node.js backend.
+HTML auth routes removed — authentication handled by Firebase + Node.js.
+
 Routes:
-  GET  /                  → main UI
-  POST /analyze           → user story → test cases
-  POST /explore           → website URL → site structure
-  POST /generate-combined → story + site → combined test cases
-  POST /execute           → combined test cases → execution results
-  POST /report            → execution results → HTML report (inline)
-  GET  /report/download   → download latest report as .html file
-  GET  /screenshots/<f>   → serve screenshot files
+  GET  /health              → health check
+  POST /analyze             → user story text → test cases / analysis
+  POST /explore             → website URL → site structure
+  POST /generate-combined   → story + site → combined test cases
+  POST /execute             → combined test cases → execution results
+  POST /report              → execution results → HTML report
+  GET  /report/download     → download latest report as .html file
+  GET  /screenshots/<f>     → serve screenshot files
 """
 
-from flask import Flask, render_template, request, jsonify, send_from_directory, Response, redirect, url_for, session
+from flask import Flask, request, jsonify, send_from_directory, Response
+from flask_cors import CORS
 from orchestrator import Orchestrator
 from agents.website_explorer import WebsiteExplorerAgent
 from agents.combined_generator import CombinedGeneratorAgent
 from agents.test_executor import TestExecutorAgent
 from agents.report_agent import ReportAgent
 import os
-import sqlite3
-from werkzeug.security import generate_password_hash, check_password_hash
 
-app        = Flask(__name__, template_folder="ui/templates", static_folder="ui/static")
-app.secret_key = "super_secret_story_analyst_key" # Needed for session management
+app = Flask(__name__, static_folder="ui/static")
 
-def init_db():
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT UNIQUE, password TEXT)''')
-    conn.commit()
-    conn.close()
+# CORS — only allow Node.js backend
+CORS(app, origins=[
+    os.environ.get("ALLOWED_ORIGIN", "http://localhost:5000"),
+    "http://localhost:5173",  # dev
+])
 
-init_db()
+# Internal secret — requests must include X-Internal-Secret header
+INTERNAL_SECRET = os.environ.get("INTERNAL_API_SECRET", "dev_secret_change_me")
+
+def check_secret():
+    secret = request.headers.get("X-Internal-Secret", "")
+    if secret != INTERNAL_SECRET:
+        return jsonify({"error": "Unauthorized — missing internal secret."}), 403
+    return None
+
 orchestrator = Orchestrator()
 explorer     = WebsiteExplorerAgent()
 combiner     = CombinedGeneratorAgent()
 executor     = TestExecutorAgent()
 reporter     = ReportAgent()
 
-_last_report_html: str = ""  # cache latest report for /report/download
+_last_report_html: str = ""
 
 
-@app.route("/")
-def index():
-    if "user_id" not in session:
-        return redirect(url_for("login"))
-    return render_template("index.html")
-
-@app.route("/signup", methods=["GET", "POST"])
-def signup():
-    if request.method == "POST":
-        name = request.form.get("name")
-        email = request.form.get("email")
-        password = request.form.get("password")
-        if not name or not email or not password:
-            return render_template("signup.html", error="All fields are required.")
-        hashed_pw = generate_password_hash(password)
-        try:
-            conn = sqlite3.connect("users.db")
-            c = conn.cursor()
-            c.execute("INSERT INTO users (name, email, password) VALUES (?, ?, ?)", (name, email, hashed_pw))
-            conn.commit()
-            conn.close()
-            return redirect(url_for("login"))
-        except sqlite3.IntegrityError:
-            return render_template("signup.html", error="Email already exists. Please login.")
-    return render_template("signup.html")
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        email = request.form.get("email")
-        password = request.form.get("password")
-        conn = sqlite3.connect("users.db")
-        c = conn.cursor()
-        c.execute("SELECT id, name, password FROM users WHERE email=?", (email,))
-        user = c.fetchone()
-        conn.close()
-        
-        if user and check_password_hash(user[2], password):
-            session["user_id"] = user[0]
-            session["user_name"] = user[1]
-            return redirect(url_for("index"))
-        else:
-            return render_template("login.html", error="Invalid email or password.")
-    return render_template("login.html")
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "service": "python-ai-microservice"})
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    err = check_secret()
+    if err: return err
+
     data = request.get_json()
     user_story = (data or {}).get("story", "").strip()
     if not user_story:
@@ -107,6 +72,9 @@ def analyze():
 
 @app.route("/explore", methods=["POST"])
 def explore():
+    err = check_secret()
+    if err: return err
+
     data  = request.get_json()
     url   = (data or {}).get("url", "").strip()
     depth = int((data or {}).get("depth", 1))
@@ -120,6 +88,9 @@ def explore():
 
 @app.route("/generate-combined", methods=["POST"])
 def generate_combined():
+    err = check_secret()
+    if err: return err
+
     data       = request.get_json() or {}
     user_story = data.get("story", "").strip()
     url        = data.get("url", "").strip()
@@ -156,21 +127,18 @@ def generate_combined():
 
 @app.route("/execute", methods=["POST"])
 def execute():
-    """
-    Body: {
-      "test_cases": [ ...combined test case objects... ],
-      "headless": true   (optional, default true)
-    }
-    Returns list of ExecutionResult dicts.
-    """
+    err = check_secret()
+    if err: return err
+
     data       = request.get_json() or {}
     test_cases = data.get("test_cases", [])
     headless   = data.get("headless", True)
+    workers    = max(1, min(int(data.get("workers", 1)), 8))  # 1–8 parallel Chrome instances
 
     if not test_cases:
         return jsonify({"error": "No test cases provided."}), 400
     try:
-        results = executor.execute_all(test_cases, headless=headless)
+        results = executor.execute_all(test_cases, headless=headless, workers=workers)
         passed  = sum(1 for r in results if r["status"] == "Pass")
         failed  = sum(1 for r in results if r["status"] == "Fail")
         errored = sum(1 for r in results if r["status"] == "Error")
@@ -187,14 +155,105 @@ def execute():
         return jsonify({"error": str(exc)}), 500
 
 
+# In-memory batch-job store  { job_id -> { status, progress, total, results, summary, error } }
+import uuid as _uuid
+_batch_jobs: dict = {}
+
+@app.route("/execute-batch", methods=["POST"])
+def execute_batch_start():
+    """Start a batched test run in background and return a job_id for polling."""
+    err = check_secret()
+    if err: return err
+
+    data        = request.get_json() or {}
+    test_cases  = data.get("test_cases", [])
+    start_index = int(data.get("start_index", 0))
+    end_index   = data.get("end_index", None)
+    if end_index is not None:
+        end_index = int(end_index)
+    batch_size  = max(1, int(data.get("batch_size", 5)))
+    headless    = data.get("headless", True)
+    workers     = max(1, min(int(data.get("workers", 1)), 8))
+
+    if not test_cases:
+        return jsonify({"error": "No test cases provided."}), 400
+
+    actual_end = end_index if end_index is not None else len(test_cases)
+    total_in_range = max(0, actual_end - start_index)
+
+    job_id = str(_uuid.uuid4())
+    _batch_jobs[job_id] = {
+        "status":   "running",
+        "progress": 0,
+        "total":    total_in_range,
+        "results":  [],
+        "summary":  None,
+        "error":    None,
+    }
+
+    def _run():
+        try:
+            def _on_batch(batch_results, _abs_start, abs_done, _total):
+                job = _batch_jobs[job_id]
+                job["results"].extend(batch_results)
+                job["progress"] = abs_done - start_index
+                _batch_jobs[job_id] = job
+
+            all_results = executor.execute_batch(
+                test_cases,
+                start_index=start_index,
+                end_index=end_index,
+                batch_size=batch_size,
+                headless=headless,
+                workers=workers,
+                on_batch_done=_on_batch,
+            )
+
+            passed  = sum(1 for r in all_results if r["status"] == "Pass")
+            failed  = sum(1 for r in all_results if r["status"] == "Fail")
+            errored = sum(1 for r in all_results if r["status"] == "Error")
+
+            _batch_jobs[job_id].update({
+                "status":   "done",
+                "progress": total_in_range,
+                "results":  all_results,
+                "summary":  {
+                    "total":   len(all_results),
+                    "passed":  passed,
+                    "failed":  failed,
+                    "errored": errored,
+                },
+            })
+        except Exception as exc:
+            _batch_jobs[job_id].update({
+                "status": "failed",
+                "error":  str(exc),
+            })
+
+    import threading as _threading
+    _threading.Thread(target=_run, daemon=True).start()
+
+    return jsonify({"job_id": job_id, "status": "running", "total": total_in_range})
+
+
+@app.route("/batch-status/<job_id>", methods=["GET"])
+def batch_status(job_id):
+    """Poll the status of a batch job."""
+    err = check_secret()
+    if err: return err
+
+    job = _batch_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+    return jsonify(job)
+
+
 @app.route("/report", methods=["POST"])
 def generate_report():
-    """
-    Body: { "results": [...], "summary": {...} }
-    Returns the generated HTML report as text/html.
-    Also caches it for /report/download.
-    """
     global _last_report_html
+    err = check_secret()
+    if err: return err
+
     data = request.get_json() or {}
     if not data.get("results"):
         return jsonify({"error": "No execution results provided."}), 400
@@ -208,7 +267,6 @@ def generate_report():
 
 @app.route("/report/download")
 def download_report():
-    """Serve the cached report as a downloadable .html file."""
     if not _last_report_html:
         return jsonify({"error": "No report generated yet. Run /report first."}), 404
     return Response(
@@ -220,16 +278,10 @@ def download_report():
 
 @app.route("/screenshots/<path:filename>")
 def serve_screenshot(filename):
-    """Serve screenshot files generated during test execution."""
-    screenshots_dir = os.path.join(
-        os.path.dirname(__file__), "screenshots"
-    )
+    screenshots_dir = os.path.join(os.path.dirname(__file__), "screenshots")
     return send_from_directory(screenshots_dir, filename)
 
-
-import os
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
-

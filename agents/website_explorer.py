@@ -46,6 +46,9 @@ class WebsiteExplorerAgent:
         queue = [(start_url, 0)]
         pages = []
 
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         while queue and len(visited) < self.MAX_PAGES:
             url, current_depth = queue.pop(0)
             if url in visited:
@@ -53,10 +56,15 @@ class WebsiteExplorerAgent:
             visited.add(url)
 
             page_data = self._scrape_page(url)
+
+            # If the initial URL fails, raise an exception instead of silently failing
+            if current_depth == 0 and "error" in page_data:
+                raise ValueError(f"Could not connect to {start_url}. Please check the URL and try again. Error: {page_data['error']}")
+
             pages.append(page_data)
 
             # Queue internal links for next depth level
-            if current_depth < depth:
+            if current_depth < depth and "error" not in page_data:
                 for link in page_data.get("links", []):
                     href = link.get("href", "")
                     if href and urlparse(href).netloc == base_domain and href not in visited:
@@ -68,7 +76,7 @@ class WebsiteExplorerAgent:
 
     def _scrape_page(self, url: str) -> dict:
         try:
-            resp = requests.get(url, headers=self.HEADERS, timeout=self.TIMEOUT)
+            resp = requests.get(url, headers=self.HEADERS, timeout=self.TIMEOUT, verify=False)
             resp.raise_for_status()
             html = resp.text
         except requests.RequestException as exc:

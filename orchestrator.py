@@ -20,7 +20,7 @@ from engines.rule_generator import RuleGenerator
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-_MODEL_NAME = "gemini-2.0-flash-lite"
+_MODEL_NAME = "gemini-2.5-flash"
 
 _SYSTEM_PROMPT = """You are a combined QA Story Analyst and Test Case Generator.
 

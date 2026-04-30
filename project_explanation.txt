@@ -1,0 +1,51 @@
+StoryAnalystAI - Project Overview
+
+1. Introduction
+StoryAnalystAI is an automated end-to-end platform designed to translate agile user stories into actionable test cases, map them to a real web application, and execute those test cases automatically in a browser. It is built as a highly modular, multi-tier application.
+
+2. Architecture & Tech Stack
+The platform uses a microservices-inspired architecture:
+
+- Frontend (React / Vite): 
+  Provides the user interface where users can input their Agile "User Stories" and the target Website URL. Displays live progress, dashboards, and final execution reports.
+
+- Primary Backend (Node.js / Express): 
+  Acts as an API Gateway and handles business logic, including:
+    - User Authentication (Firebase).
+    - Payments and subscriptions handling.
+    - Storing historical reports and user metadata.
+    - Routing heavy AI and testing tasks to the Python Microservice.
+
+- AI & Testing Microservice (Python / Flask): 
+  The core engine that processes AI logic and executes browser automation. Exposes a local JSON API to the Node.js backend.
+
+3. Flow of Execution
+A typical user execution follows this pipeline through the Python agents:
+
+  A. Story Analysis (orchestrator.py):
+     The user story textual description is sent to a Large Language Model (Google Gemini). The Orchstrator parses the output to identify features, user roles, and specific conditions mapping to success, edge cases, and failure scenarios. If the LLM exceeds quota, a local Rule-Based fallback is automatically triggered.
+
+  B. Website Exploring (agents/website_explorer.py):
+     The system crawls the provided user URL, scraping HTML structure without executing JS. It extracts active forms, inputs, fields, buttons, and navigation links. 
+
+  C. Test Case Generation (agents/combined_generator.py):
+     The story features (from Step A) and domain objects (from Step B) are cross-referenced. The engine generates automated test steps targeting the specifically found UI elements. Fallback tests for elements not present on the site are discarded to prevent hallucinations.
+
+  D. Test Execution (agents/test_executor.py):
+     Uses Selenium WebDriver to spin up headless Chrome browsers. Executes the generated actions (clicking, typing, asserting values) in parallel using a ThreadPoolExecutor. Screenshots are captured on test fail or completion.
+
+  E. Report Generation (agents/report_agent.py):
+     Aggregates all execution results, including timestamps, status (Pass/Fail/Error), execution logs, and embedded screenshots, compiling them into a responsive HTML report file downloadable by the user.
+
+4. Key Features
+- Hybrid AI + Fallback: Ensures zero downtime by relying on rule-based engines if AI rate limits are hit.
+- Parallel Execution: Runs multiple Selenium instances at once reducing total test suite runtime.
+- Smart UI Matching: Dynamically figures out if the user asks for "login functionality" which forms actually belong to the login page without arbitrary code identifiers.
+
+5. Directory Structure Summary
+- /frontend            -> React GUI code.
+- /backend             -> Node.js API Gateway, controllers, and routes (auth, payments).
+- /agents              -> Python agents (test execution, report, exploring).
+- app.py               -> Flask endpoints serving the Python agents.
+- orchestrator.py      -> LLM prompt routing and JSON parsing fallback logic.
+

@@ -1,0 +1,46 @@
+{
+  "results": [
+    {
+      "tc_id": "TC-001",
+      "feature": "Sign Up",
+      "user_role": "User",
+      "condition": "Valid Sign Up",
+      "page_url": "http://127.0.0.1:3000/test-web/index.html?serverWindowId=8d1b882a-39e2-480a-9b23-b7ef332d43e2",
+      "status": "Error",
+      "duration_seconds": 6.59,
+      "error_message": "Navigation error: Message: unknown error: net::ERR_CONNECTION_REFUSED\n  (Session info: chrome=146.0.7680.178)\nStacktrace:\n\tchromedriver!GetHandleVerifier [0x38cdf3+10b03]\n\tchromedriver!GetHandleVerifier [0x38cf24+10c34",
+      "screenshot_path": "screenshots/0001_TC-001_1775194590801.png",
+      "log": "\u2718 Navigation failed: Message: unknown error: net::ERR_CONNECTION_REFUSED\n  (Session info: chrome=146.0.7680.178)\nStacktrace:\n\tchromedriver!GetHandleVerifier [0x38cdf3+10b03]\n\tchromedriver!GetHandleVerifier [0x38cf24+10c34"
+    },
+    {
+      "tc_id": "TC-002",
+      "feature": "Sign Up",
+      "user_role": "User",
+      "condition": "Sign up with missing name",
+      "page_url": "http://127.0.0.1:3000/test-web/index.html?serverWindowId=8d1b882a-39e2-480a-9b23-b7ef332d43e2",
+      "status": "Error",
+      "duration_seconds": 2.73,
+      "error_message": "Navigation error: Message: unknown error: net::ERR_CONNECTION_REFUSED\n  (Session info: chrome=146.0.7680.178)\nStacktrace:\n\tchromedriver!GetHandleVerifier [0x38cdf3+10b03]\n\tchromedriver!GetHandleVerifier [0x38cf24+10c34",
+      "screenshot_path": "screenshots/0002_TC-002_1775194593535.png",
+      "log": "\u2718 Navigation failed: Message: unknown error: net::ERR_CONNECTION_REFUSED\n  (Session info: chrome=146.0.7680.178)\nStacktrace:\n\tchromedriver!GetHandleVerifier [0x38cdf3+10b03]\n\tchromedriver!GetHandleVerifier [0x38cf24+10c34"
+    },
+    {
+      "tc_id": "TC-003",
+      "feature": "Sign Up",
+      "user_role": "User",
+      "condition": "Sign up with invalid email",
+      "page_url": "http://127.0.0.1:3000/test-web/index.html?serverWindowId=8d1b882a-39e2-480a-9b23-b7ef332d43e2",
+      "status": "Error",
+      "duration_seconds": 1.79,
+      "error_message": "Navigation error: Message: unknown error: net::ERR_CONNECTION_REFUSED\n  (Session info: chrome=146.0.7680.178)\nStacktrace:\n\tchromedriver!GetHandleVerifier [0x38cdf3+10b03]\n\tchromedriver!GetHandleVerifier [0x38cf24+10c34",
+      "screenshot_path": "screenshots/0003_TC-003_1775194595326.png",
+      "log": "\u2718 Navigation failed: Message: unknown error: net::ERR_CONNECTION_REFUSED\n  (Session info: chrome=146.0.7680.178)\nStacktrace:\n\tchromedriver!GetHandleVerifier [0x38cdf3+10b03]\n\tchromedriver!GetHandleVerifier [0x38cf24+10c34"
+    }
+  ],
+  "summary": {
+    "total": 3,
+    "passed": 0,
+    "failed": 0,
+    "errored": 3
+  }
+}
