@@ -41,6 +41,51 @@ _UNREACHABLE_PATTERNS = (
     "ERR_ADDRESS_UNREACHABLE", "net::ERR_",
 )
 
+# Keywords that indicate a NEGATIVE test case based on its title/condition/scenario.
+# If any of these appear in the test case name, it is treated as negative regardless
+# of whether the 'type' field was set by the generator.
+_NEGATIVE_KEYWORDS = (
+    "without", "invalid", "missing", "wrong", "empty",
+    "no password", "incorrect", "bad ", "no ", "blank",
+    "fail", "error", "reject", "block", "deny", "exceed",
+    "too long", "too short", "sql injection", "xss", "script",
+    "special char", "unauth", "unauthorized", "forbidden",
+    "expired", "duplicate", "already exist", "taken",
+)
+
+
+def _is_negative_tc(tc: dict) -> bool:
+    """Return True if this test case is a NEGATIVE (or edge-case) test.
+
+    Detection priority:
+    1. Explicit 'type' field set to 'negative' or 'edge_case'  (AI generator)
+    2. Explicit 'test_type' field set to 'Negative' or 'Security'
+       (rule-based generator / _tc2 helper)
+    3. Keyword heuristic on condition / test_scenario / title fields
+       (catches cases where the generator forgot to tag the type)
+    """
+    # 1. Explicit 'type' field (AI generator format)
+    explicit_type = tc.get("type", "").lower()
+    if explicit_type in ("negative", "edge_case"):
+        return True
+
+    # 2. 'test_type' field (rule-based / _tc2 format)
+    test_type_field = tc.get("test_type", "").lower()
+    if test_type_field in ("negative", "security", "boundary", "edge_case"):
+        return True
+
+    # 3. Keyword heuristic — scan the human-readable fields
+    candidate_text = " ".join([
+        tc.get("condition", ""),
+        tc.get("test_scenario", ""),
+        tc.get("title", ""),
+        tc.get("feature", ""),
+    ]).lower()
+    if any(kw in candidate_text for kw in _NEGATIVE_KEYWORDS):
+        return True
+
+    return False
+
 # Regex: Enter 'value' in the 'fieldname' field
 _ENTER_FIELD_PAT = re.compile(
     r"""enter\s+['"]?([^'"]+?)['"]?\s+in\s+(?:the\s+)?['"]?(\w[\w\s\-]*)['"]?\s*field""",
@@ -284,7 +329,6 @@ class TestExecutorAgent:
         condition = tc.get("condition", "")
         page_url  = (tc.get("page_url") or "").strip()
         steps     = tc.get("automation_steps", [])
-        test_type = tc.get("type", "").lower()
 
         if page_url:
             if not page_url.startswith(("http://", "https://", "file://")):
@@ -327,7 +371,13 @@ class TestExecutorAgent:
                 log_lines.append("⚠ No valid page URL — skipping navigation.")
 
             # ── Run steps ─────────────────────────────────────────────
-            is_negative = test_type in ["negative", "edge_case"]
+            # Determine test polarity using the unified helper that checks
+            # explicit type fields AND keyword heuristics on the title/condition.
+            is_negative = _is_negative_tc(tc)
+            log_lines.append(
+                f"ℹ Test polarity: {'NEGATIVE' if is_negative else 'POSITIVE'} "
+                f"(type={tc.get('type','')!r}, test_type={tc.get('test_type','')!r})"
+            )
             # Extract expected error from tc or from assert steps
             expected_error = (tc.get("expected_error_message") or "").strip()
             # Snapshot page source before submit for silent-reload detection

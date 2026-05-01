@@ -642,10 +642,25 @@ class SmartTestGeneratorAgent:
         return [{"component": comp, "test_cases": tcs} for comp, tcs in suites.items()]
 
     def _tc2(self, idx, component, test_type, scenario, steps, expected, priority, page_url, auto_steps):
-        """Build a test case dict in the new grouped format."""
+        """Build a test case dict in the new grouped format.
+
+        Emits both ``test_type`` (human-readable category label) and ``type``
+        (execution-polarity field consumed by TestExecutorAgent).  The executor
+        uses ``type`` to decide whether a test is positive/negative/edge_case
+        so it must be present for every test case, regardless of generator path.
+        """
+        # Map test_type label → execution polarity understood by the executor
+        _POLARITY = {
+            "Negative": "negative",
+            "Security": "negative",   # security tests expect rejection
+            "Boundary": "edge_case",
+            "Validation": "negative", # validation tests expect error messages
+        }
+        polarity = _POLARITY.get(test_type, "positive")
         return {
             "tc_id": f"TC_{idx:02d}", "component": component,
-            "test_type": test_type, "test_scenario": scenario,
+            "test_type": test_type, "type": polarity,
+            "test_scenario": scenario,
             "test_steps": steps, "expected_result": expected,
             "priority": priority, "page_url": page_url,
             "automation_steps": auto_steps, "mapped": True,
