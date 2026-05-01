@@ -1,20 +1,20 @@
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Brain, Globe, Code2, Play, FileText, Zap, Crown, AlertTriangle } from "lucide-react";
+import { Brain, Globe, Code2, Play, FileText, Zap, Crown, AlertTriangle, Search, Wand2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import useStore from "../state/store";
 import UserStoryTab from "../tabs/UserStoryTab";
 import WebsiteExplorerTab from "../tabs/WebsiteExplorerTab";
-import CombinedTab from "../tabs/CombinedTab";
+import SmartTestGenTab from "../tabs/SmartTestGenTab";
 import TestExecutorTab from "../tabs/TestExecutorTab";
 import ReportsTab from "../tabs/ReportsTab";
 
 const TABS = [
-  { id: "story",    label: "User Stories",     icon: Brain,    component: UserStoryTab },
-  { id: "explorer", label: "Website Explorer", icon: Globe,    component: WebsiteExplorerTab },
-  { id: "combined", label: "Combined",         icon: Code2,    component: CombinedTab },
-  { id: "executor", label: "Test Executor",    icon: Play,     component: TestExecutorTab },
-  { id: "reports",  label: "Reports",          icon: FileText, component: ReportsTab },
+  { id: "story",      label: "User Stories",       icon: Brain,    component: UserStoryTab },
+  { id: "explorer",   label: "Website Explorer",   icon: Globe,    component: WebsiteExplorerTab },
+  { id: "smarttest",  label: "Smart Test Gen",     icon: Wand2,    component: SmartTestGenTab },
+  { id: "executor",   label: "Test Executor",      icon: Play,     component: TestExecutorTab },
+  { id: "reports",    label: "Reports",            icon: FileText, component: ReportsTab },
 ];
 
 const PLAN_LIMITS = { free: 10, pro: 100, premium: 9999 };

@@ -160,16 +160,43 @@ router.post("/explore-website", verifyToken, async (req, res) => {
       return res.json({ ...result.data, mock: false });
     }
 
-    // Mock fallback
+    // Mock fallback with detailed element data
     return res.json({
-      url,
+      start_url: url,
       pages: [
-        { url, title: "Home Page", features: ["Navigation", "Hero Section", "CTA Button", "Footer"], forms: ["Contact Form", "Newsletter Signup"], navigationLinks: ["/about", "/pricing", "/login"] },
-        { url: `${url}/about`, title: "About Page", features: ["Team Section", "Mission Statement", "Timeline"], forms: [], navigationLinks: ["/contact"] },
+        {
+          url,
+          title: "Home Page",
+          forms: [
+            {
+              name: "login-form", action: "/login", method: "POST", id: "login-form", class: "",
+              fields: [
+                { name: "username", type: "text", id: "username", selector: "#username", required: true, placeholder: "Enter username", class: "", maxlength: "", minlength: "", pattern: "", value: "", aria_label: "" },
+                { name: "password", type: "password", id: "password", selector: "#password", required: true, placeholder: "Enter password", class: "", maxlength: "", minlength: "", pattern: "", value: "", aria_label: "" },
+              ],
+              buttons: [
+                { text: "Login", type: "submit", id: "submit-btn", selector: "#submit-btn", class: "btn-primary" },
+              ],
+            },
+          ],
+          standalone_inputs: [
+            { tag: "input", type: "search", name: "q", id: "search", selector: "#search", text: "", placeholder: "Search...", class: "search-input", aria_label: "Search", required: false },
+            { tag: "button", type: "button", name: "", id: "toggle-nav", selector: "#toggle-nav", text: "Menu", placeholder: "", class: "nav-toggle", aria_label: "Toggle Navigation", required: false },
+          ],
+          links: [
+            { text: "About", href: `${url}/about` },
+            { text: "Contact", href: `${url}/contact` },
+            { text: "Pricing", href: `${url}/pricing` },
+          ],
+        },
+        {
+          url: `${url}/about`,
+          title: "About Page",
+          forms: [],
+          standalone_inputs: [],
+          links: [{ text: "Home", href: url }, { text: "Contact", href: `${url}/contact` }],
+        },
       ],
-      technologies: ["React", "Tailwind CSS", "Node.js"],
-      accessibilityIssues: ["Some images may lack alt tags", "Color contrast should be verified"],
-      testableAreas: ["Navigation links work correctly", "Forms submit successfully", "Responsive layout on mobile", "Page load time under 3s"],
       mock: true,
       mockNote: "Python AI service unavailable — showing demo data.",
     });
@@ -220,6 +247,108 @@ router.post("/combined", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("[/combined]", err.message);
     res.status(500).json({ error: "Failed to generate combined output. " + err.message });
+  }
+});
+
+// ─── POST /api/ai/extract-info ────────────────────────────────────────────────
+router.post("/extract-info", verifyToken, async (req, res) => {
+  const { url, query = "", depth = 1 } = req.body;
+  if (!url?.trim()) {
+    return res.status(400).json({ error: "URL is required." });
+  }
+
+  try {
+    const usage = await checkAndIncrementUsage(req.user.uid);
+    if (!usage.allowed) {
+      return res.status(429).json({ error: "Usage limit reached.", upgradeRequired: true });
+    }
+
+    const result = await proxyToPython("/extract", {
+      url,
+      query: query || "",
+      depth: Math.min(Number(depth), 2),
+    });
+
+    if (result.success) {
+      return res.json({ ...result.data, mock: false });
+    }
+
+    // Mock fallback
+    return res.json({
+      start_url: url,
+      query,
+      pages: [],
+      aggregated: {
+        pages_crawled: 0,
+        metadata: [{ url, title: "Demo Page", description: "Mock extraction — Python service unavailable." }],
+        text: { headings: { h1: ["Demo Heading"] }, paragraphs: ["This is demo content because the extraction service is currently offline."], list_items: [] },
+        images: [],
+        links: { internal: [], external: [] },
+        contact_info: { emails: ["demo@example.com"], phones: ["+1-555-0123"], addresses: ["123 Demo St, Example City, EX 12345"] },
+        tables: [],
+        structured_data: [],
+      },
+      ai_summary: "⚠️ Python AI service is unavailable. Showing placeholder data.",
+      mock: true,
+      mockNote: "Python AI service unavailable — showing demo data.",
+    });
+  } catch (err) {
+    console.error("[/extract-info]", err.message);
+    res.status(500).json({ error: "Failed to extract website info. " + err.message });
+  }
+});
+
+// ─── POST /api/ai/smart-tests ─────────────────────────────────────────────────
+router.post("/smart-tests", verifyToken, async (req, res) => {
+  const { url, query = "", user_story = "", depth = 1 } = req.body;
+  if (!url?.trim()) {
+    return res.status(400).json({ error: "URL is required." });
+  }
+
+  try {
+    const usage = await checkAndIncrementUsage(req.user.uid);
+    if (!usage.allowed) {
+      return res.status(429).json({ error: "Usage limit reached.", upgradeRequired: true });
+    }
+
+    const result = await proxyToPython("/generate-smart-tests", {
+      url,
+      query: query || "",
+      user_story: user_story || "",
+      depth: Math.min(Number(depth), 2),
+    });
+
+    if (result.success) {
+      return res.json({ ...result.data, mock: false });
+    }
+
+    // Mock fallback with grouped format
+    return res.json({
+      url, query, user_story,
+      story_breakdown: { actor: "User", action: "interact with the website", goal: "complete the desired task" },
+      components: ["Page Load"],
+      test_suites: [
+        {
+          component: "Page Load",
+          test_cases: [
+            { tc_id: "TC_01", component: "Page Load", test_type: "Functional", test_scenario: "Page loads successfully",
+              test_steps: [`Navigate to ${url}`, "Verify page loads"], expected_result: "Page loads within 3 seconds",
+              priority: "Critical", page_url: url,
+              automation_steps: [`Open browser and navigate to '${url}'.`, "Assert that the page/response reflects: 'page loaded'."], mapped: true },
+            { tc_id: "TC_02", component: "Page Load", test_type: "Negative", test_scenario: "Invalid URL returns error",
+              test_steps: [`Navigate to ${url}/nonexistent`, "Verify error page"], expected_result: "404 page displayed",
+              priority: "Medium", page_url: url + "/nonexistent",
+              automation_steps: [`Open browser and navigate to '${url}/nonexistent'.`, "Assert that the page/response reflects: '404 or error page'."], mapped: true },
+          ],
+        },
+      ],
+      summary: { total: 2, components: 1, by_type: { Functional: 1, Negative: 1 }, by_priority: { Critical: 1, Medium: 1 } },
+      ai_generated: false, pages_crawled: 0,
+      mock: true, mockNote: "Python AI service unavailable — showing demo data.",
+    });
+  } catch (err) {
+    console.error("[/smart-tests]", err.message);
+    res.status(500).json({ error: "Failed to generate smart tests. " + err.message });
   }
 });
 

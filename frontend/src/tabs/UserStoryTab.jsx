@@ -65,14 +65,16 @@ function StoryCard({ story, index }) {
 }
 
 export default function UserStoryTab() {
-  const [requirement, setRequirement] = useState("");
+  const { 
+    globalRequirement: requirement, setGlobalRequirement: setRequirement,
+    storyOutput: output, setStoryOutput: setOutput,
+    addToast, setUsageCount 
+  } = useStore();
+  
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [output, setOutput] = useState(null);
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
-
-  const { addToast, setUsageCount } = useStore();
 
   async function handleGenerate() {
     if (!requirement.trim()) { addToast("Please enter your requirement.", "warning"); return; }

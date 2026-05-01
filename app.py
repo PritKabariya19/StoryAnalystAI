@@ -19,7 +19,9 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
 from orchestrator import Orchestrator
 from agents.website_explorer import WebsiteExplorerAgent
+from agents.website_extractor import WebsiteExtractorAgent
 from agents.combined_generator import CombinedGeneratorAgent
+from agents.smart_test_generator import SmartTestGeneratorAgent
 from agents.test_executor import TestExecutorAgent
 from agents.report_agent import ReportAgent
 import os
@@ -43,7 +45,9 @@ def check_secret():
 
 orchestrator = Orchestrator()
 explorer     = WebsiteExplorerAgent()
+extractor    = WebsiteExtractorAgent()
 combiner     = CombinedGeneratorAgent()
+smart_gen    = SmartTestGeneratorAgent()
 executor     = TestExecutorAgent()
 reporter     = ReportAgent()
 
@@ -274,6 +278,43 @@ def download_report():
         mimetype="text/html",
         headers={"Content-Disposition": "attachment; filename=test_report.html"},
     )
+
+
+@app.route("/generate-smart-tests", methods=["POST"])
+def generate_smart_tests():
+    err = check_secret()
+    if err: return err
+
+    data  = request.get_json() or {}
+    url   = data.get("url", "").strip()
+    query = data.get("query", "").strip()
+    user_story = data.get("user_story", "").strip()
+    depth = int(data.get("depth", 1))
+    if not url:
+        return jsonify({"error": "No URL provided."}), 400
+    try:
+        result = smart_gen.generate(url, query=query, user_story=user_story, depth=min(depth, 2))
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/extract", methods=["POST"])
+def extract_info():
+    err = check_secret()
+    if err: return err
+
+    data  = request.get_json() or {}
+    url   = data.get("url", "").strip()
+    query = data.get("query", "").strip()
+    depth = int(data.get("depth", 1))
+    if not url:
+        return jsonify({"error": "No URL provided."}), 400
+    try:
+        result = extractor.extract(url, query=query, depth=min(depth, 2))
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/screenshots/<path:filename>")

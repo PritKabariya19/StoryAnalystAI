@@ -39,13 +39,28 @@ const useStore = create(
       // ── Generation State ──────────────────────────────────────────────────────
       storyOutput: null,
       explorerOutput: null,
-      combinedOutput: null,
+      smartTestOutput: null,
       testResults: null,
       generatedTests: [],
       executedResults: [],
       generationLoading: false,
       generationError: null,
       activeReports: [],
+
+      // ── Input State ───────────────────────────────────────────────────────────
+      globalUrl: "",
+      globalQuery: "",
+      globalUserStory: "",
+      globalRequirement: "",
+      globalDepth: 1,
+
+      setGlobalUrl: (url) => set({ globalUrl: url }),
+      setGlobalQuery: (query) => set({ globalQuery: query }),
+      setGlobalUserStory: (story) => set({ globalUserStory: story }),
+      setGlobalRequirement: (req) => set({ globalRequirement: req }),
+      setGlobalDepth: (depth) => set({ globalDepth: depth }),
+      
+      setSmartTestOutput: (data) => set({ smartTestOutput: data }),
 
       // ── Auth Actions ──────────────────────────────────────────────────────────
       initAuth: () => {

@@ -26,7 +26,9 @@ const STATUS_BADGE = {
 };
 
 function ResultRow({ test, onViewScreenshot }) {
-  const typeColor = TYPE_COLORS[test.original_tc?.type] || "text-white/40 bg-white/5";
+  const rawType = test.original_tc?.type || "";
+  const formattedType = rawType ? rawType.charAt(0).toUpperCase() + rawType.slice(1).replace('_', ' ') : "";
+  const typeColor = TYPE_COLORS[formattedType] || "text-white/40 bg-white/5";
   const screenshotUrl = test.screenshot
     ? (test.screenshot.startsWith("http") ? test.screenshot : `${BACKEND_URL}${test.screenshot}`)
     : null;
@@ -50,7 +52,7 @@ function ResultRow({ test, onViewScreenshot }) {
       {/* Type */}
       <div className="w-24 flex-shrink-0 hidden sm:block">
         <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${typeColor}`}>
-          {test.original_tc?.type || "—"}
+          {formattedType || "—"}
         </span>
       </div>
 
@@ -81,14 +83,14 @@ function ResultRow({ test, onViewScreenshot }) {
 export default function TestExecutorTab() {
   const {
     addToast,
-    combinedOutput,
+    smartTestOutput,
     generatedTests,
     setGeneratedTests,
     executedResults,
     setExecutedResults,
   } = useStore(state => ({
     addToast:          state.addToast,
-    combinedOutput:    state.combinedOutput,
+    smartTestOutput:   state.smartTestOutput,
     generatedTests:    state.generatedTests,
     setGeneratedTests: state.setGeneratedTests,
     executedResults:   state.executedResults,
@@ -112,32 +114,43 @@ export default function TestExecutorTab() {
   const testsRef     = useRef(generatedTests);
   useEffect(() => { testsRef.current = generatedTests; }, [generatedTests]);
 
-  // Map combinedOutput → normalised generatedTests whenever it changes
+  // Map smartTestOutput → normalised generatedTests whenever it changes
   useEffect(() => {
-    if (combinedOutput?.test_cases?.length > 0) {
-      const mapped = combinedOutput.test_cases.map((tc, idx) => {
-        const testId = tc.tc_id || `TC-${String(idx + 1).padStart(3, "0")}`;
-        const safeName = String(tc.condition || tc.feature || "test")
-          .replace(/[^a-zA-Z0-9 ]/g, " ")
-          .trim()
-          .slice(0, 40);
-        return {
-          id:          crypto.randomUUID?.() ?? `uid-${idx}-${Math.random()}`,
-          testId,
-          name:        `${testId} — ${safeName}`,
-          description: tc.condition || tc.title || "(no description)",
-          status:      "Pending",
-          screenshot:  null,
-          execTime:    0,
-          original_tc: tc,
-        };
+    // smartTestOutput has shape { test_suites: [ { component: "...", test_cases: [...] } ] }
+    if (smartTestOutput?.test_suites?.length > 0) {
+      // flatten tests from components
+      const allTests = [];
+      smartTestOutput.test_suites.forEach(suite => {
+        if (Array.isArray(suite.test_cases)) {
+          allTests.push(...suite.test_cases);
+        }
       });
-      setGeneratedTests(mapped);
-      setExecutedResults([]);
-      setJob(null);
-      setPage(1);
+      
+      if (allTests.length > 0) {
+        const mapped = allTests.map((tc, idx) => {
+          const testId = tc.tc_id || tc.testId || `TC-${String(idx + 1).padStart(3, "0")}`;
+          const safeName = String(tc.test_scenario || tc.condition || tc.title || tc.feature || "test")
+            .replace(/[^a-zA-Z0-9 ]/g, " ")
+            .trim()
+            .slice(0, 40);
+          return {
+            id:          crypto.randomUUID?.() ?? `uid-${idx}-${Math.random()}`,
+            testId,
+            name:        `${testId} — ${safeName}`,
+            description: tc.test_scenario || tc.condition || tc.title || "(no description)",
+            status:      "Pending",
+            screenshot:  null,
+            execTime:    0,
+            original_tc: tc,
+          };
+        });
+        setGeneratedTests(mapped);
+        setExecutedResults([]);
+        setJob(null);
+        setPage(1);
+      }
     }
-  }, [combinedOutput, setGeneratedTests, setExecutedResults]);
+  }, [smartTestOutput, setGeneratedTests, setExecutedResults]);
 
   // Cleanup polling on unmount
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);

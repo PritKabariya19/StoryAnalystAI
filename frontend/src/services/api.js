@@ -59,6 +59,12 @@ export const exploreWebsite = (url, depth = 1) =>
 export const generateCombined = (requirement, url, depth = 1) =>
   api.post("/api/ai/combined", { requirement, url, depth }).then((r) => r.data);
 
+export const extractWebsiteInfo = (url, query = "", depth = 1) =>
+  api.post("/api/ai/extract-info", { url, query, depth }).then((r) => r.data);
+
+export const generateSmartTests = (url, query = "", user_story = "", depth = 1) =>
+  api.post("/api/ai/smart-tests", { url, query, user_story, depth }).then((r) => r.data);
+
 // ─── Test Endpoints ───────────────────────────────────────────────────────────
 export const executeTests = (testCases, headless = true) =>
   api.post("/api/tests/execute", { test_cases: testCases, headless }).then((r) => r.data);

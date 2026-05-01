@@ -1,5 +1,11 @@
 """
-Test Executor Agent — Parallel Edition (Fixed)
+Test Executor Agent — Parallel Edition (Specific Error Matching)
+
+Negative test validation rules:
+  PASS  → only when the SPECIFIC expected error message is found on page
+  FAIL  → when a WRONG error message is found, or NO error message at all
+  Every negative result logs: expected_error_message, error_message_found,
+  message_match (bool), and a human-readable reason.
 """
 
 import math
@@ -14,6 +20,8 @@ from typing import List, Optional, Tuple
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException, TimeoutException, WebDriverException,
+    ElementNotInteractableException, ElementClickInterceptedException,
+    ElementNotSelectableException,
 )
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -62,6 +70,12 @@ class ExecutionResult:
     error_message:    Optional[str]
     screenshot_path:  Optional[str]
     log:              str
+    block_reason:           Optional[str] = None
+    expected_error_message: Optional[str] = None
+    error_message_found:    Optional[str] = None
+    message_match:          Optional[bool] = None
+    final_verdict:          Optional[str] = None
+    fields_filled:          Optional[List[dict]] = None
 
     def to_dict(self) -> dict:
         return {
@@ -75,6 +89,12 @@ class ExecutionResult:
             "error_message":    self.error_message,
             "screenshot_path":  self.screenshot_path,
             "log":              self.log,
+            "block_reason":           self.block_reason,
+            "expected_error_message": self.expected_error_message,
+            "error_message_found":    self.error_message_found,
+            "message_match":          self.message_match,
+            "final_verdict":          self.final_verdict,
+            "fields_filled":          self.fields_filled,
         }
 
 
@@ -83,6 +103,8 @@ class TestExecutorAgent:
     def __init__(self):
         self._shot_counter = 0
         self._shot_lock    = threading.Lock()
+        # Per-test-case fill log, reset at the start of each _execute_one
+        self._fill_log: List[dict] = []
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -262,6 +284,7 @@ class TestExecutorAgent:
         condition = tc.get("condition", "")
         page_url  = (tc.get("page_url") or "").strip()
         steps     = tc.get("automation_steps", [])
+        test_type = tc.get("type", "").lower()
 
         if page_url:
             if not page_url.startswith(("http://", "https://", "file://")):
@@ -271,6 +294,7 @@ class TestExecutorAgent:
             page_url = ""
 
         log_lines: List[str] = []
+        self._fill_log = []   # reset fill log for this test case
         start = time.time()
 
         try:
@@ -297,21 +321,126 @@ class TestExecutorAgent:
                         error_message=f"Navigation error: {err_str}",
                         screenshot_path=shot,
                         log="\n".join(log_lines),
+                        fields_filled=self._fill_log if self._fill_log else None,
                     )
             else:
                 log_lines.append("⚠ No valid page URL — skipping navigation.")
 
             # ── Run steps ─────────────────────────────────────────────
+            is_negative = test_type in ["negative", "edge_case"]
+            # Extract expected error from tc or from assert steps
+            expected_error = (tc.get("expected_error_message") or "").strip()
+            # Snapshot page source before submit for silent-reload detection
+            pre_submit_source: Optional[str] = None
+
             for i, step in enumerate(steps, 1):
-                s = step.strip()
-                if not s or s.startswith("#"):
+                if not step:
                     continue
                 try:
-                    self._run_step(s, driver)
-                    log_lines.append(f"✔ Step {i}: {s[:90]}")
+                    if isinstance(step, dict):
+                        action = step.get('action', 'unknown').lower()
+
+                        # --- Custom Assert Handling for Negative Tests ---
+                        if is_negative and action == "assert":
+                            step_expected = (step.get("expected", "") or "").strip()
+                            # Use step-level expected if tc-level is empty
+                            eff_expected = expected_error or step_expected
+
+                            # Check URL changed (means system did NOT block)
+                            cur_url = driver.current_url.rstrip("/")
+                            p_url = page_url.rstrip("/")
+
+                            if cur_url != p_url and p_url not in cur_url:
+                                log_lines.append(f"✘ Step {i} FAILED: URL changed to {cur_url}")
+                                shot = self._screenshot(driver, tc_id, screenshots_dir)
+                                return ExecutionResult(
+                                    tc_id=tc_id, feature=feature, user_role=user_role,
+                                    condition=condition, page_url=page_url, status="Fail",
+                                    duration_seconds=time.time() - start,
+                                    error_message="URL changed unexpectedly — system did not block.",
+                                    screenshot_path=shot, log="\n".join(log_lines),
+                                    block_reason="not_blocked",
+                                    expected_error_message=eff_expected,
+                                    error_message_found="none",
+                                    message_match=False,
+                                    final_verdict=f"FAIL — system did not block, redirected to {cur_url}",
+                                    fields_filled=self._fill_log if self._fill_log else None,
+                                )
+
+                            # ── Specific error message matching ──
+                            result = self._evaluate_negative_result(
+                                driver, eff_expected, tc_id, feature,
+                                user_role, condition, page_url, start,
+                                screenshots_dir, log_lines, i,
+                                pre_submit_source=pre_submit_source,
+                            )
+                            return result
+
+                        # Capture page source before click (for silent reload detection)
+                        if action == "click" and is_negative:
+                            try:
+                                pre_submit_source = driver.page_source
+                            except Exception:
+                                pass
+
+                        self._run_json_step(step, driver)
+                        action_log = step.get('action', 'unknown').upper()
+                        val = step.get('url') or step.get('value') or step.get('expected') or step.get('locator', {}).get('value') or ''
+                        log_lines.append(f"✔ Step {i}: [{action_log}] {val}")
+                    else:
+                        s = step.strip()
+                        if not s or s.startswith("#"):
+                            continue
+                        self._run_step(s, driver)
+                        log_lines.append(f"✔ Step {i}: {s[:90]}")
                 except (AssertionError, NoSuchElementException,
                         TimeoutException, WebDriverException) as exc:
-                    log_lines.append(f"✘ Step {i} FAILED: {s[:90]}")
+
+                    # 1. Blocked Action (e.g. Disabled submit button)
+                    if is_negative and isinstance(exc, (ElementNotInteractableException, ElementClickInterceptedException)):
+                        # Button was disabled/blocked — still verify the correct error
+                        eff_expected = expected_error
+                        if not eff_expected:
+                            # No expected error specified → structural block is enough
+                            log_lines.append(f"✔ Step {i} BLOCKED as expected: {str(exc)[:60]}")
+                            shot = self._screenshot(driver, tc_id, screenshots_dir)
+                            return ExecutionResult(
+                                tc_id=tc_id, feature=feature, user_role=user_role,
+                                condition=condition, page_url=page_url,
+                                status="Pass",
+                                duration_seconds=time.time() - start,
+                                error_message=None,
+                                screenshot_path=shot,
+                                log="\n".join(log_lines),
+                                block_reason="button_disabled",
+                                expected_error_message="N/A",
+                                error_message_found="N/A (button disabled)",
+                                message_match=True,
+                                final_verdict="PASS — system correctly blocked via button_disabled",
+                                fields_filled=self._fill_log if self._fill_log else None,
+                            )
+                        # Button blocked + expected error → still verify message
+                        log_lines.append(f"⚠ Step {i} button blocked — checking error message...")
+                        return self._evaluate_negative_result(
+                            driver, eff_expected, tc_id, feature,
+                            user_role, condition, page_url, start,
+                            screenshots_dir, log_lines, i,
+                            block_reason_prefix="button_disabled",
+                            pre_submit_source=pre_submit_source,
+                        )
+
+                    # 2. For negative tests with other exceptions, check error message
+                    if is_negative and expected_error:
+                        log_lines.append(f"⚠ Step {i} exception: {str(exc)[:80]} — checking error message...")
+                        return self._evaluate_negative_result(
+                            driver, expected_error, tc_id, feature,
+                            user_role, condition, page_url, start,
+                            screenshots_dir, log_lines, i,
+                            pre_submit_source=pre_submit_source,
+                        )
+
+                    # 3. Positive test or no expected error → normal failure
+                    log_lines.append(f"✘ Step {i} FAILED")
                     log_lines.append(f"   Reason: {str(exc)[:120]}")
                     shot = self._screenshot(driver, tc_id, screenshots_dir)
                     return ExecutionResult(
@@ -322,9 +451,21 @@ class TestExecutorAgent:
                         error_message=str(exc)[:300],
                         screenshot_path=shot,
                         log="\n".join(log_lines),
+                        fields_filled=self._fill_log if self._fill_log else None,
                     )
 
-            # ── Pass ───────────────────────────────────────────────────
+            # ── All steps completed ───────────────────────────────────
+            if is_negative and expected_error:
+                # Negative test reached end without explicit assert
+                # → must still verify the expected error message is on the page
+                log_lines.append("⚠ All steps done — evaluating negative test result...")
+                return self._evaluate_negative_result(
+                    driver, expected_error, tc_id, feature,
+                    user_role, condition, page_url, start,
+                    screenshots_dir, log_lines, len(steps),
+                    pre_submit_source=pre_submit_source,
+                )
+
             log_lines.append("✅ All steps passed.")
             pass_shot = self._screenshot(driver, tc_id, screenshots_dir)
             return ExecutionResult(
@@ -335,6 +476,7 @@ class TestExecutorAgent:
                 error_message=None,
                 screenshot_path=pass_shot,
                 log="\n".join(log_lines),
+                fields_filled=self._fill_log if self._fill_log else None,
             )
 
         except Exception as exc:
@@ -348,9 +490,228 @@ class TestExecutorAgent:
                 error_message=str(exc)[:300],
                 screenshot_path=shot,
                 log="\n".join(log_lines),
+                fields_filled=self._fill_log if self._fill_log else None,
             )
 
-    # ── Thread-safe screenshot ─────────────────────────────────────────
+    # ── Negative-test evaluation (centralised) ─────────────────────────
+
+    def _evaluate_negative_result(
+        self,
+        driver,
+        expected_error:    str,
+        tc_id:             str,
+        feature:           str,
+        user_role:         str,
+        condition:         str,
+        page_url:          str,
+        start_time:        float,
+        screenshots_dir,
+        log_lines:         list,
+        step_num:          int,
+        block_reason_prefix: str = "",
+        pre_submit_source: Optional[str] = None,
+    ) -> ExecutionResult:
+        """Decide PASS / FAIL for a negative test by matching the SPECIFIC
+        expected error message against VISIBLE error elements only.
+
+        Rules:
+          PASS  -> expected error found in visible error elements (case-insensitive)
+          FAIL  -> wrong error shown, or no error at all
+
+        Features:
+          - Only matches against visible error text (never raw page source)
+          - Polls up to 3s for error messages to appear (handles async JS)
+          - Detects silent page reload via pre_submit_source comparison
+          - Always attaches fields_filled to the result
+        """
+        expected_lower = expected_error.lower().strip()
+        fill_log = self._fill_log if self._fill_log else None
+
+        # ── Poll for error messages (up to 3s, every 0.5s) ──
+        error_list: List[str] = []
+        for _attempt in range(7):  # 0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0
+            error_list = self._find_visible_error_text(driver)
+            if error_list:
+                break
+            time.sleep(0.5)
+
+        # Format for logging: show all found errors
+        if error_list:
+            found_display = " | ".join(error_list)
+        else:
+            found_display = "none"
+
+        # ── Check if expected error is in ANY visible error text ──
+        match_found = any(
+            expected_lower in err.lower()
+            for err in error_list
+        )
+
+        if match_found:
+            # ── RULE 1: Correct error found → PASS ──
+            reason = "Correct error shown"
+            block_reason = block_reason_prefix or "error_message_shown"
+            log_lines.append(
+                f"✔ Step {step_num}: [NEGATIVE PASS] "
+                f"Expected error '{expected_error}' found on page."
+            )
+            shot = self._screenshot(driver, tc_id, screenshots_dir)
+            return ExecutionResult(
+                tc_id=tc_id, feature=feature, user_role=user_role,
+                condition=condition, page_url=page_url,
+                status="Pass",
+                duration_seconds=time.time() - start_time,
+                error_message=None,
+                screenshot_path=shot,
+                log="\n".join(log_lines),
+                block_reason=block_reason,
+                expected_error_message=expected_error,
+                error_message_found=found_display,
+                message_match=True,
+                final_verdict=f"PASS — {reason}",
+                fields_filled=fill_log,
+            )
+
+        # Expected error NOT found
+        if error_list:
+            # ── RULE 2: Wrong error shown → FAIL ──
+            reason = (
+                f"Wrong error shown: expected '{expected_error}' "
+                f"but found '{found_display}'"
+            )
+            block_reason = block_reason_prefix or "error_message_shown"
+            log_lines.append(
+                f"✘ Step {step_num}: [NEGATIVE FAIL] {reason}"
+            )
+            shot = self._screenshot(driver, tc_id, screenshots_dir)
+            return ExecutionResult(
+                tc_id=tc_id, feature=feature, user_role=user_role,
+                condition=condition, page_url=page_url,
+                status="Fail",
+                duration_seconds=time.time() - start_time,
+                error_message=reason,
+                screenshot_path=shot,
+                log="\n".join(log_lines),
+                block_reason=block_reason,
+                expected_error_message=expected_error,
+                error_message_found=found_display,
+                message_match=False,
+                final_verdict=f"FAIL — {reason}",
+                fields_filled=fill_log,
+            )
+
+        # ── RULE 3: No error at all → FAIL ──
+        # Detect silent page reload
+        block_reason = block_reason_prefix or "no_error_shown"
+        if pre_submit_source is not None:
+            try:
+                current_source = driver.page_source or ""
+                if current_source != pre_submit_source:
+                    block_reason = block_reason_prefix or "page_reloaded_silently"
+                    log_lines.append(
+                        f"⚠ Step {step_num}: Page source changed (silent reload detected)"
+                    )
+            except Exception:
+                pass
+
+        reason = "No error message found on page"
+        log_lines.append(
+            f"✘ Step {step_num}: [NEGATIVE FAIL] {reason}"
+        )
+        shot = self._screenshot(driver, tc_id, screenshots_dir)
+        return ExecutionResult(
+            tc_id=tc_id, feature=feature, user_role=user_role,
+            condition=condition, page_url=page_url,
+            status="Fail",
+            duration_seconds=time.time() - start_time,
+            error_message=reason,
+            screenshot_path=shot,
+            log="\n".join(log_lines),
+            block_reason=block_reason,
+            expected_error_message=expected_error,
+            error_message_found="none",
+            message_match=False,
+            final_verdict=f"FAIL — {reason}",
+            fields_filled=fill_log,
+        )
+
+    # ── Thread-safe screenshot & Error Helpers ─────────────────────────
+
+    def _find_visible_error_text(self, driver) -> List[str]:
+        """Scan the page for visible error/validation text.
+
+        Searches (in order):
+          1. Elements whose class contains error/invalid/alert/danger/warning
+          2. Elements with role="alert"
+          3. Toast/snackbar containers
+          4. HTML5 validation messages via JS
+
+        Returns a list of individual error texts found (empty list = none).
+        """
+        found_texts: List[str] = []
+
+        # 1. Class-based error elements
+        try:
+            _TR = "translate(@class, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+            xpath_class = (
+                f"//*["
+                f"contains({_TR}, 'error') or "
+                f"contains({_TR}, 'invalid') or "
+                f"contains({_TR}, 'alert') or "
+                f"contains({_TR}, 'danger') or "
+                f"contains({_TR}, 'warning') or "
+                f"contains({_TR}, 'validation') or "
+                f"contains({_TR}, 'feedback')]"
+            )
+            for el in driver.find_elements(By.XPATH, xpath_class):
+                if el.is_displayed():
+                    text = el.text.strip()
+                    if text and text not in found_texts:
+                        found_texts.append(text)
+        except Exception:
+            pass
+
+        # 2. role="alert" elements
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, '[role="alert"]'):
+                if el.is_displayed():
+                    text = el.text.strip()
+                    if text and text not in found_texts:
+                        found_texts.append(text)
+        except Exception:
+            pass
+
+        # 3. Toast / snackbar containers
+        try:
+            for sel in ['[class*="toast"]', '[class*="snackbar"]', '[class*="notification"]']:
+                for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        text = el.text.strip()
+                        if text and text not in found_texts:
+                            found_texts.append(text)
+        except Exception:
+            pass
+
+        # 4. HTML5 constraint-validation messages via JS (individual msgs)
+        try:
+            js_msgs = driver.execute_script("""
+                var msgs = [];
+                document.querySelectorAll('input,select,textarea').forEach(function(el){
+                    if (!el.validity.valid && el.validationMessage) {
+                        msgs.push(el.validationMessage);
+                    }
+                });
+                return msgs;
+            """)
+            if js_msgs:
+                for msg in js_msgs:
+                    msg = msg.strip()
+                    if msg and msg not in found_texts:
+                        found_texts.append(msg)
+        except Exception:
+            pass
+
+        return found_texts
 
     def _screenshot(self, driver, tc_id, screenshots_dir):
         try:
@@ -376,6 +737,69 @@ class TestExecutorAgent:
             return None
 
     # ── Step interpreter ───────────────────────────────────────────────
+
+    def _run_json_step(self, step: dict, driver: webdriver.Chrome) -> None:
+        action = step.get("action", "").lower()
+        wait = WebDriverWait(driver, WAIT_TIMEOUT)
+
+        if action == "navigate":
+            url = step.get("url")
+            if url:
+                try:
+                    driver.get(url)
+                    time.sleep(0.5)
+                except TimeoutException:
+                    pass
+            return
+
+        locator = step.get("locator", {})
+        ltype = locator.get("type", "").lower()
+        lval = locator.get("value", "")
+
+        def _get_element():
+            if not lval: return None
+            if ltype == "id": return wait.until(EC.presence_of_element_located((By.ID, lval)))
+            if ltype == "name": return wait.until(EC.presence_of_element_located((By.NAME, lval)))
+            if ltype == "css": return wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, lval)))
+            if ltype == "xpath": return wait.until(EC.presence_of_element_located((By.XPATH, lval)))
+            # fallback
+            return self._find_input(wait, lval)
+
+        if action == "input":
+            value = step.get("value", "")
+            el = _get_element()
+            if el:
+                fill_result = self._smart_fill_element(driver, el, lval or "field", value)
+                # Propagate hard failures (element not interactable) as exceptions
+                if fill_result["status"].startswith("error"):
+                    raise ElementNotInteractableException(
+                        f"smart_fill failed on '{lval}': {fill_result['status']}"
+                    )
+            return
+
+        if action == "click":
+            el = _get_element()
+            if el:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView(true);", el)
+                    wait.until(EC.element_to_be_clickable(el)).click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", el)
+            else:
+                # If no strict locator, try smart click with 'value'
+                self._smart_click(driver, wait, step.get("value", ""))
+            return
+
+        if action == "assert":
+            atype = step.get("type", "url")
+            expected = step.get("expected", "")
+            if atype == "url":
+                cur = driver.current_url
+                assert expected in cur, f"URL mismatch: '{expected}' not in '{cur}'"
+            else:
+                src = driver.page_source.lower()
+                assert expected.lower() in src, f"Text '{expected}' not found on page"
+            return
 
     def _run_step(self, step: str, driver: webdriver.Chrome) -> None:
         s  = step.strip()
@@ -414,8 +838,13 @@ class TestExecutorAgent:
             name  = m.group(2).strip().strip("'\"")
             try:
                 el = self._find_input(wait, name)
-                el.clear()
-                el.send_keys(value)
+                fill_result = self._smart_fill_element(driver, el, name, value)
+                if fill_result["status"].startswith("error"):
+                    raise NoSuchElementException(
+                        f"Could not fill field '{name}': {fill_result['status']}"
+                    )
+            except NoSuchElementException:
+                raise
             except Exception as e:
                 raise NoSuchElementException(f"Could not fill field '{name}': {e}")
             return
@@ -576,27 +1005,201 @@ class TestExecutorAgent:
         if not clicked:
             raise NoSuchElementException(f"Clickable element '{target}' not found")
 
+    # ── Universal Smart Fill ────────────────────────────────────────────
+
+    def _smart_fill_element(
+        self,
+        driver: webdriver.Chrome,
+        element,
+        field_name: str,
+        value: str,
+    ) -> dict:
+        """Detect the element type and use the correct fill method.
+
+        Supports: text/email/password/number/search/tel/url inputs,
+        select dropdowns, checkboxes, radio buttons, textareas,
+        file uploads, date/time inputs, range sliders, hidden fields.
+        Skips disabled/read-only fields gracefully.
+
+        Returns a dict with: field, value, element_type, status, warning.
+        Always appends the result to self._fill_log.
+        """
+        result: dict = {
+            "field": field_name,
+            "value": str(value),
+            "element_type": None,
+            "status": None,
+            "warning": None,
+        }
+
+        try:
+            # ── Detect element type ───────────────────────────────────
+            tag = element.tag_name.lower()
+            input_type = (element.get_attribute("type") or "text").lower()
+            is_disabled = element.get_attribute("disabled") is not None
+            is_readonly = element.get_attribute("readonly") is not None
+            result["element_type"] = f"{tag}[type={input_type}]"
+
+            # ── TYPE 10: Disabled / Read-only → skip ──────────────────
+            if is_disabled or is_readonly:
+                result["status"] = "skipped - field is disabled or read-only"
+                self._fill_log.append(result)
+                return result
+
+            # ── TYPE 1: Text / Email / Password / Number / Search / Tel / URL
+            if tag == "input" and input_type in (
+                "text", "email", "password", "number",
+                "search", "tel", "url", "",
+            ):
+                element.clear()
+                element.send_keys(str(value))
+                result["status"] = f"filled - {input_type or 'text'} input"
+
+            # ── TYPE 2: Select / Dropdown ─────────────────────────────
+            elif tag == "select":
+                sel = Select(element)
+                try:
+                    sel.select_by_visible_text(str(value))
+                    result["status"] = "filled - dropdown by text"
+                except Exception:
+                    try:
+                        sel.select_by_value(str(value))
+                        result["status"] = "filled - dropdown by value"
+                    except Exception:
+                        sel.select_by_index(0)
+                        result["status"] = "filled - dropdown default (index 0)"
+                        result["warning"] = f"value '{value}' not found, used default"
+
+            # ── TYPE 3: Checkbox ──────────────────────────────────────
+            elif tag == "input" and input_type == "checkbox":
+                should_check = str(value).lower() in ("true", "yes", "1", "on")
+                if element.is_selected() != should_check:
+                    try:
+                        element.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", element)
+                result["status"] = f"filled - checkbox set to {should_check}"
+
+            # ── TYPE 4: Radio Button ──────────────────────────────────
+            elif tag == "input" and input_type == "radio":
+                name_attr = element.get_attribute("name") or field_name
+                radios = driver.find_elements(By.NAME, name_attr)
+                clicked = False
+                for radio in radios:
+                    if (radio.get_attribute("value") or "").lower() == str(value).lower():
+                        try:
+                            radio.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", radio)
+                        clicked = True
+                        break
+                result["status"] = (
+                    "filled - radio selected" if clicked
+                    else f"skipped - radio value '{value}' not found"
+                )
+
+            # ── TYPE 5: Textarea ──────────────────────────────────────
+            elif tag == "textarea":
+                element.clear()
+                element.send_keys(str(value))
+                result["status"] = "filled - textarea"
+
+            # ── TYPE 6: File Upload ───────────────────────────────────
+            elif tag == "input" and input_type == "file":
+                element.send_keys(str(value))
+                result["status"] = "filled - file upload"
+
+            # ── TYPE 7: Date / Time ───────────────────────────────────
+            elif tag == "input" and input_type in ("date", "time", "datetime-local", "month", "week"):
+                driver.execute_script(
+                    "arguments[0].value = arguments[1];"
+                    "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                    element, str(value),
+                )
+                result["status"] = f"filled - {input_type} via script"
+
+            # ── TYPE 8: Range / Slider ────────────────────────────────
+            elif tag == "input" and input_type == "range":
+                driver.execute_script(
+                    "arguments[0].value = arguments[1];"
+                    "arguments[0].dispatchEvent(new Event('input', {bubbles:true}));"
+                    "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
+                    element, str(value),
+                )
+                result["status"] = "filled - range slider via script"
+
+            # ── TYPE 9: Hidden Field ──────────────────────────────────
+            elif tag == "input" and input_type == "hidden":
+                driver.execute_script(
+                    "arguments[0].value = arguments[1];", element, str(value),
+                )
+                result["status"] = "filled - hidden field via script"
+                result["warning"] = "field is hidden - filled via JavaScript"
+
+            # ── TYPE 11: Unknown / Unsupported ────────────────────────
+            else:
+                # Last-resort: try send_keys anyway
+                try:
+                    element.clear()
+                    element.send_keys(str(value))
+                    result["status"] = f"filled - fallback send_keys on {tag}[{input_type}]"
+                    result["warning"] = "used fallback send_keys for unsupported type"
+                except Exception:
+                    result["status"] = f"skipped - unsupported type: {tag}[{input_type}]"
+
+        except ElementNotInteractableException:
+            result["status"] = "skipped - element not interactable"
+        except ElementNotSelectableException:
+            result["status"] = "skipped - element not selectable"
+        except Exception as e:
+            result["status"] = f"error - {str(e)[:150]}"
+
+        self._fill_log.append(result)
+        return result
+
     # ── Element helpers ─────────────────────────────────────────────────
 
     def _find_input(self, wait, locator: str):
+        """Find a form element (input, textarea, or select) by name, id,
+        placeholder, or label text."""
         loc = locator.strip()
-        # Try name, id
+        # Try name, id  (matches input, select, textarea — any tag)
         for by in (By.NAME, By.ID):
             try:
                 return wait.until(EC.presence_of_element_located((by, loc)))
             except TimeoutException:
                 pass
-        # placeholder partial match
+        # placeholder partial match (input + textarea)
         try:
             css = f"input[placeholder*='{loc}' i], textarea[placeholder*='{loc}' i]"
             return wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, css)))
         except TimeoutException:
             pass
-        # label text
+        # label text → following input, select, or textarea
         try:
-            xpath = f"//label[contains(translate(normalize-space(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{loc.lower()}')]//following-sibling::input[1]"
+            loc_lower = loc.lower()
+            xpath = (
+                f"//label[contains(translate(normalize-space(),"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+                f"'{loc_lower}')]"
+                f"/following-sibling::*[self::input or self::select or self::textarea][1]"
+            )
             return wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
         except TimeoutException:
+            pass
+        # label with for="id" attribute
+        try:
+            loc_lower = loc.lower()
+            label_xpath = (
+                f"//label[contains(translate(normalize-space(),"
+                f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
+                f"'{loc_lower}')]"
+            )
+            label_el = wait.until(EC.presence_of_element_located((By.XPATH, label_xpath)))
+            for_id = label_el.get_attribute("for")
+            if for_id:
+                return wait.until(EC.presence_of_element_located((By.ID, for_id)))
+        except (TimeoutException, Exception):
             pass
         raise NoSuchElementException(f"Input '{loc}' not found by name, id, placeholder, or label")
 
