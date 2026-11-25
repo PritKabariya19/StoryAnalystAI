@@ -1,0 +1,70 @@
+services:
+  - type: web
+    name: storyanalyst-ai
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./ai-service/Dockerfile
+    dockerContext: ./ai-service
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: INTERNAL_API_SECRET
+        generateValue: true
+
+  - type: web
+    name: storyanalyst-backend
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn config.wsgi --bind 0.0.0.0:$PORT --workers 1 --threads 16 --timeout 0 --access-logfile -
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.7
+      - key: INTERNAL_API_SECRET
+        fromService:
+          type: web
+          name: storyanalyst-ai
+          envVarKey: INTERNAL_API_SECRET
+      - key: PYTHON_AI_URL
+        fromService:
+          type: web
+          name: storyanalyst-ai
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: FRONTEND_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_BASE64
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+
+  - type: web
+    name: storyanalyst-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_BACKEND_URL
+        sync: false
+      - key: VITE_FIREBASE_API_KEY
+        sync: false
+      - key: VITE_FIREBASE_AUTH_DOMAIN
+        sync: false
+      - key: VITE_FIREBASE_PROJECT_ID
+        sync: false
+      - key: VITE_FIREBASE_STORAGE_BUCKET
+        sync: false
+      - key: VITE_FIREBASE_MESSAGING_SENDER_ID
+        sync: false
+      - key: VITE_FIREBASE_APP_ID
+        sync: false

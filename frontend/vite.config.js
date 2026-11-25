@@ -8,7 +8,7 @@ export default defineConfig({
     proxy: {
       // During dev, proxy API calls to backend
       "/api": {
-        target: "http://localhost:5000",
+        target: "http://localhost:5001",
         changeOrigin: true,
       },
     },
@@ -18,7 +18,7 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          firebase:     ["firebase/app", "firebase/auth", "firebase/firestore"],
+          firebase:     ["firebase/app", "firebase/auth"],
           framer:       ["framer-motion"],
           vendor:       ["react", "react-dom", "react-router-dom"],
         },
