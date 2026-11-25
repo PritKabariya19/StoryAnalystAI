@@ -623,3 +623,315 @@ class TestExecutorAgent:
         if page_url:
             if not page_url.startswith(("http://", "https://", "file://")):
                 # Default to http:// if somehow missing (e.g., user typed localhost:3000)
+                page_url = "http://" + page_url
+        else:
+            page_url = ""
+
+        log_lines: List[str] = []
+        self._fill_log = []     # reset per-TC state
+        self._alert_texts = []
+        start = time.time()
+
+        try:
+            # ── Initial navigation ─────────────────────────────────────
+            if page_url:
+                try:
+                    if self._navigate(page, page_url):
+                        log_lines.append(
+                            f"⚠ Page load exceeded {PAGE_LOAD_TIMEOUT}s at {page_url} "
+                            "— continuing with partially loaded page"
+                        )
+                    log_lines.append(f"✔ Navigated to {page_url}")
+                    blocked = self._wait_out_captcha(page, headless, log_lines)
+                    if blocked:
+                        return self._captcha_result(
+                            page, tc_id, feature, user_role, condition,
+                            page_url, start, screenshots_dir, log_lines, blocked)
+                except PlaywrightError as nav_err:
+                    err_str = str(nav_err)[:200]
+                    log_lines.append(f"✘ Navigation failed: {err_str}")
+                    shot = self._screenshot(page, tc_id, screenshots_dir)
+                    return ExecutionResult(
+                        tc_id=tc_id, feature=feature, user_role=user_role,
+                        condition=condition, page_url=page_url,
+                        status="Error",
+                        duration_seconds=time.time() - start,
+                        error_message=f"Navigation error: {err_str}",
+                        screenshot_path=shot,
+                        log="\n".join(log_lines),
+                        fields_filled=self._fill_log if self._fill_log else None,
+                    )
+            else:
+                log_lines.append("⚠ No valid page URL — skipping navigation.")
+
+            # ── Run steps ─────────────────────────────────────────────
+            # Determine test polarity using the unified helper that checks
+            # explicit type fields AND keyword heuristics on the title/condition.
+            is_negative = _is_negative_tc(tc)
+            log_lines.append(
+                f"ℹ Test polarity: {'NEGATIVE' if is_negative else 'POSITIVE'} "
+                f"(type={tc.get('type','')!r}, test_type={tc.get('test_type','')!r})"
+            )
+            # Extract expected error from tc or from assert steps
+            expected_error = (tc.get("expected_error_message") or "").strip()
+            # Snapshot page source before submit for silent-reload detection
+            pre_submit_source: Optional[str] = None
+
+            for i, step in enumerate(steps, 1):
+                if not step:
+                    continue
+                try:
+                    if isinstance(step, dict):
+                        action = step.get('action', 'unknown').lower()
+
+                        # --- Custom Assert Handling for Negative Tests ---
+                        if is_negative and action == "assert":
+                            step_expected = (step.get("expected", "") or "").strip()
+                            # Use step-level expected if tc-level is empty
+                            eff_expected = expected_error or step_expected
+
+                            # Check URL changed (means system did NOT block)
+                            cur_url = page.url.rstrip("/")
+                            p_url = page_url.rstrip("/")
+
+                            if cur_url != p_url and p_url not in cur_url:
+                                log_lines.append(f"✘ Step {i} FAILED: URL changed to {cur_url}")
+                                shot = self._screenshot(page, tc_id, screenshots_dir)
+                                return ExecutionResult(
+                                    tc_id=tc_id, feature=feature, user_role=user_role,
+                                    condition=condition, page_url=page_url, status="Fail",
+                                    duration_seconds=time.time() - start,
+                                    error_message="URL changed unexpectedly — system did not block.",
+                                    screenshot_path=shot, log="\n".join(log_lines),
+                                    block_reason="not_blocked",
+                                    expected_error_message=eff_expected,
+                                    error_message_found="none",
+                                    message_match=False,
+                                    final_verdict=f"FAIL — system did not block, redirected to {cur_url}",
+                                    fields_filled=self._fill_log if self._fill_log else None,
+                                )
+
+                            # ── Specific error message matching ──
+                            result = self._evaluate_negative_result(
+                                page, eff_expected, tc_id, feature,
+                                user_role, condition, page_url, start,
+                                screenshots_dir, log_lines, i,
+                                pre_submit_source=pre_submit_source,
+                            )
+                            return result
+
+                        # Capture page source before click (for silent reload detection)
+                        if action == "click" and is_negative:
+                            try:
+                                pre_submit_source = page.content()
+                            except Exception:
+                                pass
+
+                        self._run_json_step(step, page)
+                        kind = action
+                        action_log = step.get('action', 'unknown').upper()
+                        val = step.get('url') or step.get('value') or step.get('expected') or step.get('locator', {}).get('value') or ''
+                        log_lines.append(f"✔ Step {i}: [{action_log}] {val}")
+                    else:
+                        kind = None
+                        s = step.strip()
+                        if not s or s.startswith("#"):
+                            continue
+                        kind = self._run_step(s, page)
+                        log_lines.append(f"✔ Step {i}: {s[:90]}")
+
+                    # A click / navigation can land on a CAPTCHA (e.g. after submit)
+                    if kind in ("click", "navigate"):
+                        blocked = self._wait_out_captcha(page, headless, log_lines)
+                        if blocked:
+                            return self._captcha_result(
+                                page, tc_id, feature, user_role, condition,
+                                page_url, start, screenshots_dir, log_lines, blocked)
+                except (AssertionError, PlaywrightError) as exc:
+
+                    # 1. Blocked Action (e.g. Disabled submit button)
+                    if is_negative and isinstance(exc, ElementBlocked):
+                        # Button was disabled/blocked — still verify the correct error
+                        eff_expected = expected_error
+                        if not eff_expected:
+                            # No expected error specified → structural block is enough
+                            log_lines.append(f"✔ Step {i} BLOCKED as expected: {str(exc)[:60]}")
+                            shot = self._screenshot(page, tc_id, screenshots_dir)
+                            return ExecutionResult(
+                                tc_id=tc_id, feature=feature, user_role=user_role,
+                                condition=condition, page_url=page_url,
+                                status="Pass",
+                                duration_seconds=time.time() - start,
+                                error_message=None,
+                                screenshot_path=shot,
+                                log="\n".join(log_lines),
+                                block_reason="button_disabled",
+                                expected_error_message="N/A",
+                                error_message_found="N/A (button disabled)",
+                                message_match=True,
+                                final_verdict="PASS — system correctly blocked via button_disabled",
+                                fields_filled=self._fill_log if self._fill_log else None,
+                            )
+                        # Button blocked + expected error → still verify message
+                        log_lines.append(f"⚠ Step {i} button blocked — checking error message...")
+                        return self._evaluate_negative_result(
+                            page, eff_expected, tc_id, feature,
+                            user_role, condition, page_url, start,
+                            screenshots_dir, log_lines, i,
+                            block_reason_prefix="button_disabled",
+                            pre_submit_source=pre_submit_source,
+                        )
+
+                    # 2. For negative tests with other exceptions, check error message
+                    if is_negative and expected_error:
+                        log_lines.append(f"⚠ Step {i} exception: {str(exc)[:80]} — checking error message...")
+                        return self._evaluate_negative_result(
+                            page, expected_error, tc_id, feature,
+                            user_role, condition, page_url, start,
+                            screenshots_dir, log_lines, i,
+                            pre_submit_source=pre_submit_source,
+                        )
+
+                    # 3. Positive test or no expected error → normal failure
+                    log_lines.append(f"✘ Step {i} FAILED")
+                    log_lines.append(f"   Reason: {str(exc)[:120]}")
+                    shot = self._screenshot(page, tc_id, screenshots_dir)
+                    return ExecutionResult(
+                        tc_id=tc_id, feature=feature, user_role=user_role,
+                        condition=condition, page_url=page_url,
+                        status="Fail",
+                        duration_seconds=time.time() - start,
+                        error_message=str(exc)[:300],
+                        screenshot_path=shot,
+                        log="\n".join(log_lines),
+                        fields_filled=self._fill_log if self._fill_log else None,
+                    )
+
+            # ── All steps completed ───────────────────────────────────
+            if is_negative and expected_error:
+                # Negative test reached end without explicit assert
+                # → must still verify the expected error message is on the page
+                log_lines.append("⚠ All steps done — evaluating negative test result...")
+                return self._evaluate_negative_result(
+                    page, expected_error, tc_id, feature,
+                    user_role, condition, page_url, start,
+                    screenshots_dir, log_lines, len(steps),
+                    pre_submit_source=pre_submit_source,
+                )
+
+            log_lines.append("✅ All steps passed.")
+            pass_shot = self._screenshot(page, tc_id, screenshots_dir)
+            return ExecutionResult(
+                tc_id=tc_id, feature=feature, user_role=user_role,
+                condition=condition, page_url=page_url,
+                status="Pass",
+                duration_seconds=time.time() - start,
+                error_message=None,
+                screenshot_path=pass_shot,
+                log="\n".join(log_lines),
+                fields_filled=self._fill_log if self._fill_log else None,
+            )
+
+        except Exception as exc:
+            log_lines.append(f"💥 Unexpected error: {str(exc)[:200]}")
+            shot = self._screenshot(page, tc_id, screenshots_dir)
+            return ExecutionResult(
+                tc_id=tc_id, feature=feature, user_role=user_role,
+                condition=condition, page_url=page_url,
+                status="Error",
+                duration_seconds=time.time() - start,
+                error_message=str(exc)[:300],
+                screenshot_path=shot,
+                log="\n".join(log_lines),
+                fields_filled=self._fill_log if self._fill_log else None,
+            )
+
+    # ── Negative-test evaluation (centralised) ─────────────────────────
+
+    def _evaluate_negative_result(
+        self,
+        page,
+        expected_error:    str,
+        tc_id:             str,
+        feature:           str,
+        user_role:         str,
+        condition:         str,
+        page_url:          str,
+        start_time:        float,
+        screenshots_dir,
+        log_lines:         list,
+        step_num:          int,
+        block_reason_prefix: str = "",
+        pre_submit_source: Optional[str] = None,
+    ) -> ExecutionResult:
+        """Decide PASS / FAIL for a negative test by matching the SPECIFIC
+        expected error message against VISIBLE error elements only.
+
+        Rules:
+          PASS  -> expected error found in visible error elements (case-insensitive)
+          FAIL  -> wrong error shown, or no error at all
+
+        Features:
+          - Only matches against visible error text (never raw page source)
+          - Polls up to 3s for error messages to appear (handles async JS)
+          - Detects silent page reload via pre_submit_source comparison
+          - Always attaches fields_filled to the result
+        """
+        expected_lower = expected_error.lower().strip()
+        fill_log = self._fill_log if self._fill_log else None
+
+        # ── Poll for error messages (up to 3s, every 0.5s) ──
+        error_list: List[str] = []
+        for _attempt in range(7):  # 0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0
+            error_list = self._find_visible_error_text(page)
+            if error_list:
+                break
+            page.wait_for_timeout(500)
+
+        # Format for logging: show all found errors
+        if error_list:
+            found_display = " | ".join(error_list)
+        else:
+            found_display = "none"
+
+        # ── Check if expected error is in ANY visible error text ──
+        match_found = any(
+            expected_lower in err.lower()
+            for err in error_list
+        )
+
+        if match_found:
+            # ── RULE 1: Correct error found → PASS ──
+            reason = "Correct error shown"
+            block_reason = block_reason_prefix or "error_message_shown"
+            log_lines.append(
+                f"✔ Step {step_num}: [NEGATIVE PASS] "
+                f"Expected error '{expected_error}' found on page."
+            )
+            shot = self._screenshot(page, tc_id, screenshots_dir)
+            return ExecutionResult(
+                tc_id=tc_id, feature=feature, user_role=user_role,
+                condition=condition, page_url=page_url,
+                status="Pass",
+                duration_seconds=time.time() - start_time,
+                error_message=None,
+                screenshot_path=shot,
+                log="\n".join(log_lines),
+                block_reason=block_reason,
+                expected_error_message=expected_error,
+                error_message_found=found_display,
+                message_match=True,
+                final_verdict=f"PASS — {reason}",
+                fields_filled=fill_log,
+            )
+
+        # Expected error NOT found
+        if error_list:
+            # ── RULE 2: Wrong error shown → FAIL ──
+            reason = (
+                f"Wrong error shown: expected '{expected_error}' "
+                f"but found '{found_display}'"
+            )
+            block_reason = block_reason_prefix or "error_message_shown"
+            log_lines.append(
+                f"✘ Step {step_num}: [NEGATIVE FAIL] {reason}"
