@@ -1248,3 +1248,316 @@ class TestExecutorAgent:
             opt = self._extract_quoted(s)
             if opt:
                 selects = page.locator("select")
+                if selects.count():
+                    try:
+                        index = self._option_index(selects.first, opt, by_value=False)
+                        if index is not None:
+                            selects.first.select_option(index=index)
+                    except PlaywrightError:
+                        pass
+            return
+
+        # ── Checkbox ────────────────────────────────────────────────────
+        if "checkbox" in sl or "check the" in sl:
+            cbs = page.locator("input[type='checkbox']")
+            if cbs.count() and not cbs.first.is_checked():
+                self._click(cbs.first)
+            return
+
+        # Unknown step — silently skip
+
+    # ── Smart click (buttons + links + inputs) ─────────────────────────
+
+    def _smart_click(self, page: Page, target: str):
+        tl = target.lower()
+        clicked = False
+
+        # 1. input[type=submit]
+        for el in page.locator("input[type='submit'], input[type='button']").all():
+            val = (el.evaluate("e => e.value") or "").strip().lower()
+            if val and (tl in val or val in tl):
+                self._click(el)
+                clicked = True
+                break
+
+        # 2. button elements, 3. anchor/link elements
+        for tag in ("button", "a"):
+            if clicked:
+                break
+            for el in page.locator(tag).all():
+                if tl in _shown_text(el).lower():
+                    self._click(el)
+                    if tag == "a":
+                        page.wait_for_timeout(500)  # wait for navigation
+                    clicked = True
+                    break
+
+        # 4. XPath fallback with case-insensitive translate
+        if not clicked:
+            lit = _xpath_literal(tl)
+            txt = _XP_LOWER.format("normalize-space()")
+            val = _XP_LOWER.format("@value")
+            xpath = (
+                f"//button[contains({txt},{lit})]"
+                f"|//a[contains({txt},{lit})]"
+                f"|//*[@role='button'][contains({txt},{lit})]"
+                f"|//input[contains({val},{lit}) and (@type='submit' or @type='button')]"
+            )
+            try:
+                el = page.locator(f"xpath={xpath}").first
+                el.wait_for(state="visible")
+                el.evaluate("e => e.click()")
+                clicked = True
+            except PlaywrightError:
+                pass
+
+        # 5. Any submit
+        if not clicked:
+            try:
+                el = page.locator("button[type='submit'], input[type='submit']")
+                if el.count():
+                    el.first.evaluate("e => e.click()")
+                    clicked = True
+            except PlaywrightError:
+                pass
+
+        if not clicked:
+            raise ElementNotFound(f"Clickable element '{target}' not found")
+
+    # ── Universal Smart Fill ────────────────────────────────────────────
+
+    def _smart_fill_element(
+        self,
+        page: Page,
+        element: Locator,
+        field_name: str,
+        value: str,
+    ) -> dict:
+        """Detect the element type and use the correct fill method.
+
+        Supports: text/email/password/number/search/tel/url inputs,
+        select dropdowns, checkboxes, radio buttons, textareas,
+        file uploads, date/time inputs, range sliders, hidden fields.
+        Skips disabled/read-only fields gracefully.
+
+        Returns a dict with: field, value, element_type, status, warning.
+        Always appends the result to self._fill_log.
+        """
+        result: dict = {
+            "field": field_name,
+            "value": str(value),
+            "element_type": None,
+            "status": None,
+            "warning": None,
+        }
+
+        try:
+            # ── Detect element type ───────────────────────────────────
+            tag = element.evaluate("e => e.tagName.toLowerCase()")
+            input_type = (element.evaluate("e => e.type || e.getAttribute('type')") or "text").lower()
+            is_disabled = element.get_attribute("disabled") is not None
+            is_readonly = element.get_attribute("readonly") is not None
+            result["element_type"] = f"{tag}[type={input_type}]"
+
+            # ── TYPE 10: Disabled / Read-only → skip ──────────────────
+            if is_disabled or is_readonly:
+                result["status"] = "skipped - field is disabled or read-only"
+                self._fill_log.append(result)
+                return result
+
+            # ── TYPE 1: Text / Email / Password / Number / Search / Tel / URL
+            if tag == "input" and input_type in (
+                "text", "email", "password", "number",
+                "search", "tel", "url", "",
+            ):
+                self._type_into(element, str(value))
+                result["status"] = f"filled - {input_type or 'text'} input"
+
+            # ── TYPE 2: Select / Dropdown ─────────────────────────────
+            elif tag == "select":
+                index = self._option_index(element, str(value), by_value=False)
+                if index is not None:
+                    result["status"] = "filled - dropdown by text"
+                else:
+                    index = self._option_index(element, str(value), by_value=True)
+                    if index is not None:
+                        result["status"] = "filled - dropdown by value"
+                    else:
+                        index = 0
+                        result["status"] = "filled - dropdown default (index 0)"
+                        result["warning"] = f"value '{value}' not found, used default"
+                element.select_option(index=index)
+
+            # ── TYPE 3: Checkbox ──────────────────────────────────────
+            elif tag == "input" and input_type == "checkbox":
+                should_check = str(value).lower() in ("true", "yes", "1", "on")
+                if element.is_checked() != should_check:
+                    self._click(element)
+                result["status"] = f"filled - checkbox set to {should_check}"
+
+            # ── TYPE 4: Radio Button ──────────────────────────────────
+            elif tag == "input" and input_type == "radio":
+                name_attr = element.get_attribute("name") or field_name
+                clicked = False
+                for radio in page.locator(f'[name="{_css_string(name_attr)}"]').all():
+                    if (radio.evaluate("e => e.value") or "").lower() == str(value).lower():
+                        self._click(radio)
+                        clicked = True
+                        break
+                result["status"] = (
+                    "filled - radio selected" if clicked
+                    else f"skipped - radio value '{value}' not found"
+                )
+
+            # ── TYPE 5: Textarea ──────────────────────────────────────
+            elif tag == "textarea":
+                self._type_into(element, str(value))
+                result["status"] = "filled - textarea"
+
+            # ── TYPE 6: File Upload ───────────────────────────────────
+            elif tag == "input" and input_type == "file":
+                element.set_input_files(str(value))
+                result["status"] = "filled - file upload"
+
+            # ── TYPE 7: Date / Time ───────────────────────────────────
+            elif tag == "input" and input_type in ("date", "time", "datetime-local", "month", "week"):
+                element.evaluate(
+                    "(e, v) => { e.value = v;"
+                    "e.dispatchEvent(new Event('change', {bubbles:true})); }",
+                    str(value),
+                )
+                result["status"] = f"filled - {input_type} via script"
+
+            # ── TYPE 8: Range / Slider ────────────────────────────────
+            elif tag == "input" and input_type == "range":
+                element.evaluate(
+                    "(e, v) => { e.value = v;"
+                    "e.dispatchEvent(new Event('input', {bubbles:true}));"
+                    "e.dispatchEvent(new Event('change', {bubbles:true})); }",
+                    str(value),
+                )
+                result["status"] = "filled - range slider via script"
+
+            # ── TYPE 9: Hidden Field ──────────────────────────────────
+            elif tag == "input" and input_type == "hidden":
+                element.evaluate("(e, v) => { e.value = v; }", str(value))
+                result["status"] = "filled - hidden field via script"
+                result["warning"] = "field is hidden - filled via JavaScript"
+
+            # ── TYPE 11: Unknown / Unsupported ────────────────────────
+            else:
+                # Last-resort: try typing anyway
+                try:
+                    self._type_into(element, str(value))
+                    result["status"] = f"filled - fallback send_keys on {tag}[{input_type}]"
+                    result["warning"] = "used fallback send_keys for unsupported type"
+                except Exception:
+                    result["status"] = f"skipped - unsupported type: {tag}[{input_type}]"
+
+        except PlaywrightTimeoutError:
+            # Playwright waited for the element to become usable and it never did
+            result["status"] = "skipped - element not interactable"
+        except Exception as e:
+            result["status"] = f"error - {str(e)[:150]}"
+
+        self._fill_log.append(result)
+        return result
+
+    # ── Element helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _type_into(el: Locator, value: str) -> None:
+        """Clear, then type key by key so the page sees real keyboard events
+        and invalid characters are rejected the way they are for a user."""
+        el.fill("")
+        el.press_sequentially(value, timeout=60000)
+
+    @staticmethod
+    def _option_index(select: Locator, wanted: str, by_value: bool) -> Optional[int]:
+        """Index of the <option> whose value / visible text equals wanted."""
+        options = select.evaluate(
+            "(s, byValue) => Array.from(s.options, o => byValue ? o.value"
+            " : o.text.replace(/\\s+/g, ' ').trim())",
+            by_value,
+        )
+        return options.index(wanted) if wanted in options else None
+
+    def _find_input(self, page: Page, locator: str) -> Locator:
+        """Find a form element (input, textarea, or select) by name, id,
+        associated label, placeholder or aria-label.
+
+        Strategies are tried in priority order on every poll, so the most
+        precise match wins. Visible elements are preferred; a hidden match is
+        only returned once half the wait time has passed without a visible one.
+        """
+        loc = locator.strip()
+        css_q = loc.replace("\\", "\\\\").replace("'", "\\'")
+        lit = _xpath_literal(loc.lower())
+        label_txt = _XP_LOWER.format("normalize-space()")
+        field = "self::input or self::select or self::textarea"
+        label = f"//label[contains({label_txt},{lit})]"
+        strategies = [
+            f'[name="{_css_string(loc)}"]',
+            f'[id="{_css_string(loc)}"]',
+            None,                                                  # <label for="x">
+            f"xpath={label}//*[{field}]",                          # <label>Text <input></label>
+            f"input[placeholder*='{css_q}' i], textarea[placeholder*='{css_q}' i]",
+            f"input[aria-label*='{css_q}' i], textarea[aria-label*='{css_q}' i], select[aria-label*='{css_q}' i]",
+            f"xpath={label}/following::*[{field}][1]",             # label then sibling input
+        ]
+
+        def _candidates(selector) -> List[Locator]:
+            if selector is not None:
+                return page.locator(selector).all()
+            out: List[Locator] = []
+            for lab in page.locator(f"xpath={label}[@for]").all():
+                fid = lab.get_attribute("for")
+                if fid:
+                    out.extend(page.locator(f'[id="{_css_string(fid)}"]').all())
+            return out
+
+        started = time.time()
+        while time.time() - started < WAIT_TIMEOUT:
+            fallback = None
+            for selector in strategies:
+                try:
+                    els = _candidates(selector)
+                except PlaywrightError:
+                    continue
+                for el in els:
+                    try:
+                        if _is_shown(el):
+                            return el
+                    except PlaywrightError:
+                        continue
+                    if fallback is None:
+                        fallback = el
+            if fallback is not None and time.time() - started >= WAIT_TIMEOUT / 2:
+                return fallback
+            page.wait_for_timeout(250)
+
+        raise ElementNotFound(
+            f"Input '{loc}' not found by name, id, label, placeholder, or aria-label"
+        )
+
+    @staticmethod
+    def _visible_text(page: Page) -> str:
+        """Lower-cased text a user can actually see (plus form field values),
+        excluding scripts, attributes and hidden markup."""
+        try:
+            return (page.evaluate("""() => {
+                var t = document.body ? document.body.innerText : '';
+                document.querySelectorAll('input,textarea').forEach(function(e){
+                  if (e.type !== 'password' && e.value) t += '\\n' + e.value; });
+                return t;
+            }""") or "").lower()
+        except PlaywrightError:
+            return (page.content() or "").lower()
+
+    def _extract_quoted(self, s: str) -> Optional[str]:
+        m = re.search(r"""['"]([^'"]+)['"]""", s)
+        return m.group(1).strip() if m else None
+
+    def _extract_url(self, s: str) -> Optional[str]:
+        m = re.search(r"https?://[^\s\"']+", s)
+        return m.group(0).rstrip(".,;") if m else None
