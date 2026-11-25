@@ -4,6 +4,8 @@ WORKDIR /app
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright PYTHONUNBUFFERED=1
 
 COPY requirements.txt .
+# Playwright's bundled Node needs libatomic1, which the slim image lacks.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1
 RUN pip install --no-cache-dir -r requirements.txt gunicorn \
     && playwright install --with-deps chromium
 
