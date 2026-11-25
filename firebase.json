@@ -1,0 +1,15 @@
+{
+  "firestore": {
+    "location": "asia-south1",
+    "rules": "firestore.rules"
+  },
+  "auth": {
+    "providers": {
+      "emailPassword": true,
+      "googleSignIn": {
+        "oAuthBrandDisplayName": "StoryAnalystAI",
+        "supportEmail": "bhargav.gajera.412@gmail.com"
+      }
+    }
+  }
+}
