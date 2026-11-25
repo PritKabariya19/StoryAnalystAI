@@ -1,8 +1,8 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { authLogin, authSignup, authFirebaseLogin } from "../services/api";
-import { signInWithPopup, signOut as firebaseSignOut, onAuthStateChanged } from "firebase/auth";
-import { auth, googleProvider, isFirebaseConfigured } from "../services/firebase";
+import { authLogin, authSignup, authMe } from "../services/api";
+import * as authService from "../services/authService";
+import { auth, isFirebaseConfigured } from "../services/firebase";
 
 // Decode JWT manually to get user data across reloads
 function parseJwt(token) {
@@ -21,6 +21,29 @@ function parseJwt(token) {
   }
 }
 
+const fromLocal = (u) => ({ uid: u.uid, email: u.email, displayName: u.name });
+
+/** Replace the free-plan defaults with the stored profile. On failure the user stays signed in. */
+async function loadProfile(set, get) {
+  const uid = get().user?.uid;
+  try {
+    const { user } = await authMe();
+    if (uid && get().user?.uid === uid) {
+      set({ plan: user.plan, usageCount: user.usageCount });
+    }
+  } catch (err) {
+    console.warn("Could not load the user profile:", err.message);
+  }
+}
+
+/** Start a Django (local JWT) session, ending any Firebase one. */
+async function startLocalSession(set, get, { user, token }) {
+  localStorage.setItem("token", token);
+  if (isFirebaseConfigured && auth.currentUser) await authService.signOutFirebase();
+  set({ user: fromLocal(user), plan: user.plan || "free", usageCount: 0 });
+  loadProfile(set, get);
+}
+
 // ─── Zustand Store ────────────────────────────────────────────────────────────
 const useStore = create(
   persist(
@@ -29,7 +52,8 @@ const useStore = create(
       user: null,
       plan: "free",
       usageCount: 0,
-      authLoading: true,
+      authLoading: true,      // restoring the session on page load
+      authSubmitting: false,  // a sign-in or sign-up request is running
       authError: null,
 
       // ── UI State ──────────────────────────────────────────────────────────────
@@ -64,78 +88,75 @@ const useStore = create(
 
       // ── Auth Actions ──────────────────────────────────────────────────────────
       initAuth: () => {
-        // 1. Try Local JWT first
+        // 1. Restore a local JWT session
         const token = localStorage.getItem("token");
-        if (token) {
-          const payload = parseJwt(token);
-          if (payload && payload.exp * 1000 > Date.now()) {
-            set({
-              user: { uid: payload.uid, email: payload.email, displayName: payload.name },
-              plan: payload.plan || "free",
-              usageCount: payload.usageCount || 0,
-              authLoading: false,
-            });
-            return () => {}; // return empty unsubscribe
-          } else {
-            localStorage.removeItem("token");
-          }
+        const payload = token ? parseJwt(token) : null;
+        if (payload && payload.exp * 1000 > Date.now()) {
+          set({ user: fromLocal(payload), plan: payload.plan || "free", authLoading: false });
+          loadProfile(set, get);
+        } else if (token) {
+          localStorage.removeItem("token");
         }
 
-        // 2. Fallback to Firebase checking
+        // 2. Always watch Firebase, so sign-in still works after a local logout
         if (isFirebaseConfigured) {
-          const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+          return authService.watchAuthState((firebaseUser) => {
             if (firebaseUser) {
+              localStorage.removeItem("token");
+              const isNewUser = get().user?.uid !== firebaseUser.uid;
               set({
-                user: {
-                  uid: firebaseUser.uid,
-                  email: firebaseUser.email,
-                  displayName: firebaseUser.displayName,
-                  photoURL: firebaseUser.photoURL,
-                },
-                plan: "free",
-                usageCount: 0,
+                user: authService.toUser(firebaseUser),
+                ...(isNewUser && { plan: "free", usageCount: 0 }),
                 authLoading: false,
               });
-            } else {
+              loadProfile(set, get);
+            } else if (!localStorage.getItem("token")) {
               set({ user: null, plan: "free", usageCount: 0, authLoading: false });
             }
           });
-          return unsubscribe;
         }
 
-        // 3. No auth configured
-        set({ user: null, authLoading: false });
+        set({ authLoading: false });
         return () => {};
       },
 
       signup: async (email, password, name) => {
-        set({ authLoading: true, authError: null });
+        set({ authSubmitting: true, authError: null });
         try {
-          const { user, token } = await authSignup({ email, password, name });
-          localStorage.setItem("token", token);
-          set({
-            user: { uid: user.uid, email: user.email, displayName: user.name },
-            plan: user.plan || "free",
-            authLoading: false,
-          });
+          if (isFirebaseConfigured) {
+            const user = await authService.signUpWithEmail(email, password, name);
+            localStorage.removeItem("token");
+            set({ user });
+            await loadProfile(set, get);
+          } else {
+            await startLocalSession(set, get, await authSignup({ email, password, name }));
+          }
+          set({ authSubmitting: false });
         } catch (err) {
-          set({ authLoading: false, authError: err.message });
+          set({ authSubmitting: false, authError: authService.authErrorMessage(err) });
           throw err;
         }
       },
 
       login: async (email, password) => {
-        set({ authLoading: true, authError: null });
+        set({ authSubmitting: true, authError: null });
         try {
-          const { user, token } = await authLogin({ email, password });
-          localStorage.setItem("token", token);
-          set({
-            user: { uid: user.uid, email: user.email, displayName: user.name },
-            plan: user.plan || "free",
-            authLoading: false,
-          });
+          let useLocal = !isFirebaseConfigured;
+          if (!useLocal) {
+            try {
+              await authService.signInWithEmail(email, password);
+              localStorage.removeItem("token");
+            } catch (err) {
+              if (!authService.isBadCredential(err)) throw err;
+              useLocal = true; // may be an account created before Firebase
+            }
+          }
+          if (useLocal) {
+            await startLocalSession(set, get, await authLogin({ email, password }));
+          }
+          set({ authSubmitting: false });
         } catch (err) {
-          set({ authLoading: false, authError: err.message });
+          set({ authSubmitting: false, authError: authService.authErrorMessage(err) });
           throw err;
         }
       },
@@ -145,23 +166,41 @@ const useStore = create(
           set({ authError: "Google sign-in is not configured." });
           throw new Error("Not configured");
         }
-        set({ authLoading: true, authError: null });
+        set({ authSubmitting: true, authError: null });
         try {
-          const { user } = await signInWithPopup(auth, googleProvider);
-          const token = await user.getIdToken();
-          // Sync with backend local DB if needed via authFirebaseLogin, or just rely on Firebase token
-          await authFirebaseLogin(token); 
-          set({ authLoading: false });
+          await authService.signInWithGoogle();
+          localStorage.removeItem("token");
+          set({ authSubmitting: false });
         } catch (err) {
-          set({ authLoading: false, authError: "Google authentication failed." });
+          set({
+            authSubmitting: false,
+            authError: authService.isPopupDismissed(err) ? null : authService.authErrorMessage(err),
+          });
           throw err;
         }
       },
 
+      resetPassword: async (email) => {
+        if (!isFirebaseConfigured) {
+          set({ authError: "Password reset is not configured." });
+          throw new Error("Not configured");
+        }
+        set({ authError: null });
+        try {
+          await authService.resetPassword(email);
+        } catch (err) {
+          if (err.code === "auth/user-not-found") return; // don't reveal which emails exist
+          set({ authError: authService.authErrorMessage(err) });
+          throw err;
+        }
+      },
+
+      clearAuthError: () => set({ authError: null }),
+
       logout: async () => {
         localStorage.removeItem("token");
         if (isFirebaseConfigured && auth.currentUser) {
-          await firebaseSignOut(auth);
+          await authService.signOutFirebase();
         }
         set({
           user: null, plan: "free", usageCount: 0,

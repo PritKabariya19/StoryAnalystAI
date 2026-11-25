@@ -1,7 +1,6 @@
 // Firebase client SDK initialization
 import { initializeApp } from "firebase/app";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey:            import.meta.env.VITE_FIREBASE_API_KEY,
@@ -12,25 +11,17 @@ const firebaseConfig = {
   appId:             import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-// Check if Firebase config is provided
-const isFirebaseConfigured = firebaseConfig.apiKey && firebaseConfig.apiKey !== "your_api_key_here";
+// Treat the .env.example placeholders ("your_...") as not configured
+const isFirebaseConfigured = Boolean(firebaseConfig.apiKey) && !firebaseConfig.apiKey.startsWith("your_");
 
-let app, auth, db, googleProvider;
+let auth = null;
+let googleProvider = null;
 
 if (isFirebaseConfigured) {
-  app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
+  auth = getAuth(initializeApp(firebaseConfig));
   googleProvider = new GoogleAuthProvider();
-  googleProvider.addScope("email");
-  googleProvider.addScope("profile");
-  console.log("✅ Firebase initialized.");
 } else {
-  console.warn("⚠️  Firebase not configured — running in mock auth mode.");
-  // Mock auth/db objects for development without Firebase
-  auth = null;
-  db = null;
-  googleProvider = null;
+  console.warn("⚠️  Firebase not configured — only local email/password login is available.");
 }
 
-export { auth, db, googleProvider, isFirebaseConfigured };
+export { auth, googleProvider, isFirebaseConfigured };
