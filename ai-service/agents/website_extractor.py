@@ -287,3 +287,292 @@ class WebsiteExtractorAgent:
 
             if urlparse(full).netloc == base_domain:
                 internal.append(entry)
+            else:
+                external.append(entry)
+
+            if len(internal) + len(external) >= 60:
+                break
+
+        return {"internal": internal[:30], "external": external[:30]}
+
+    # ── Contact info ───────────────────────────────────────────────────
+
+    def _extract_contact(self, soup: BeautifulSoup) -> dict:
+        page_text = soup.get_text(separator=" ", strip=True)
+
+        emails = list(set(self._EMAIL_RE.findall(page_text)))[:10]
+
+        raw_phones = self._PHONE_RE.findall(page_text)
+        phones = list(set(
+            p.strip() for p in raw_phones
+            if len(re.sub(r"\D", "", p)) >= 7
+        ))[:10]
+
+        # Address heuristic: look for text blocks containing address keywords
+        addresses: list = []
+        for tag in soup.find_all(["address", "p", "span", "div"]):
+            txt = tag.get_text(strip=True)
+            if txt and len(txt) < 300:
+                lower = txt.lower()
+                if any(h in lower for h in self._ADDRESS_HINTS):
+                    if txt not in addresses:
+                        addresses.append(txt)
+            if len(addresses) >= 5:
+                break
+
+        # Also grab mailto: and tel: links
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("mailto:"):
+                email = href[7:].split("?")[0].strip()
+                if email and email not in emails:
+                    emails.append(email)
+            elif href.startswith("tel:"):
+                phone = href[4:].strip()
+                if phone and phone not in phones:
+                    phones.append(phone)
+
+        return {
+            "emails":    emails,
+            "phones":    phones,
+            "addresses": addresses,
+        }
+
+    # ── Tables ─────────────────────────────────────────────────────────
+
+    def _extract_tables(self, soup: BeautifulSoup) -> list:
+        tables: list = []
+        for table_tag in soup.find_all("table"):
+            rows: list = []
+            for tr in table_tag.find_all("tr"):
+                cells = [
+                    td.get_text(strip=True)
+                    for td in tr.find_all(["th", "td"])
+                ]
+                if cells:
+                    rows.append(cells)
+            if rows:
+                # Use first row as header if it has <th> elements
+                header_row = table_tag.find("tr")
+                has_header = bool(header_row and header_row.find("th"))
+                tables.append({
+                    "has_header": has_header,
+                    "rows":       rows,
+                })
+            if len(tables) >= 10:
+                break
+        return tables
+
+    # ── Structured Data (JSON-LD, Microdata) ───────────────────────────
+
+    def _extract_structured_data(self, soup: BeautifulSoup) -> list:
+        items: list = []
+
+        # JSON-LD
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                items.append({"type": "json-ld", "data": data})
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Microdata (itemscope)
+        for el in soup.find_all(attrs={"itemscope": True}):
+            item_type = el.get("itemtype", "")
+            props: dict = {}
+            for prop in el.find_all(attrs={"itemprop": True}):
+                name = prop.get("itemprop", "")
+                value = (
+                    prop.get("content")
+                    or prop.get("href")
+                    or prop.get("src")
+                    or prop.get_text(strip=True)
+                )
+                if name and value:
+                    props[name] = value
+            if props:
+                items.append({
+                    "type": "microdata",
+                    "item_type": item_type,
+                    "properties": props,
+                })
+            if len(items) >= 10:
+                break
+
+        return items
+
+    # ── Aggregate across pages ─────────────────────────────────────────
+
+    def _aggregate(self, pages: list) -> dict:
+        """Merge data from all crawled pages into a single summary dict."""
+        all_headings: dict = {}
+        all_paragraphs: list = []
+        all_list_items: list = []
+        all_images: list = []
+        all_internal_links: list = []
+        all_external_links: list = []
+        all_emails: set = set()
+        all_phones: set = set()
+        all_addresses: list = []
+        all_tables: list = []
+        all_structured: list = []
+        all_metadata: list = []
+
+        for page in pages:
+            if "error" in page:
+                continue
+
+            # Text
+            text = page.get("text", {})
+            for level, items in text.get("headings", {}).items():
+                all_headings.setdefault(level, []).extend(items)
+            all_paragraphs.extend(text.get("paragraphs", []))
+            all_list_items.extend(text.get("list_items", []))
+
+            # Images
+            all_images.extend(page.get("images", []))
+
+            # Links
+            links = page.get("links", {})
+            all_internal_links.extend(links.get("internal", []))
+            all_external_links.extend(links.get("external", []))
+
+            # Contact
+            contact = page.get("contact_info", {})
+            all_emails.update(contact.get("emails", []))
+            all_phones.update(contact.get("phones", []))
+            for addr in contact.get("addresses", []):
+                if addr not in all_addresses:
+                    all_addresses.append(addr)
+
+            # Tables
+            all_tables.extend(page.get("tables", []))
+
+            # Structured data
+            all_structured.extend(page.get("structured_data", []))
+
+            # Metadata
+            meta = page.get("metadata", {})
+            if meta:
+                all_metadata.append(meta)
+
+        return {
+            "pages_crawled": len([p for p in pages if "error" not in p]),
+            "metadata":      all_metadata,
+            "text": {
+                "headings":   all_headings,
+                "paragraphs": all_paragraphs[:80],
+                "list_items": all_list_items[:80],
+            },
+            "images":          all_images[:40],
+            "links": {
+                "internal": all_internal_links[:40],
+                "external": all_external_links[:40],
+            },
+            "contact_info": {
+                "emails":    sorted(all_emails),
+                "phones":    sorted(all_phones),
+                "addresses": all_addresses[:10],
+            },
+            "tables":          all_tables[:15],
+            "structured_data": all_structured[:15],
+        }
+
+    # ── Gemini AI summarisation ────────────────────────────────────────
+
+    def _ai_summarise(self, aggregated: dict, query: str) -> str:
+        """
+        Send the aggregated extraction data + user query to Gemini
+        and get a focused, structured summary.
+        """
+        # Build a compact representation to stay within token limits
+        compact = self._compact_for_llm(aggregated)
+
+        prompt = (
+            "You are an expert web data analyst. A user has asked the following question "
+            "about a website that was just crawled:\n\n"
+            f"USER QUERY: \"{query}\"\n\n"
+            "Below is the structured data extracted from the website. "
+            "Analyze it and provide a clear, comprehensive answer to the user's query. "
+            "Focus ONLY on information relevant to the query. "
+            "If the requested information is not found, say so clearly.\n\n"
+            "Format your response in clean markdown with headers, bullet points, "
+            "and tables where appropriate.\n\n"
+            f"EXTRACTED DATA:\n```json\n{compact}\n```"
+        )
+
+        try:
+            model = genai.GenerativeModel(model_name=GEMINI_MODEL)
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as exc:
+            return f"⚠️ AI summarization failed: {str(exc)[:200]}"
+
+    def _compact_for_llm(self, aggregated: dict) -> str:
+        """
+        Create a JSON string from the aggregated data, truncated to fit
+        within Gemini's context window comfortably.
+        """
+        compact: dict = {}
+
+        # Metadata
+        metas = aggregated.get("metadata", [])
+        if metas:
+            compact["page_metadata"] = metas[:3]
+
+        # Text (truncated)
+        text = aggregated.get("text", {})
+        compact["headings"] = text.get("headings", {})
+        paragraphs = text.get("paragraphs", [])
+        compact["paragraphs"] = paragraphs[:30]
+        list_items = text.get("list_items", [])
+        compact["list_items"] = list_items[:30]
+
+        # Contact
+        contact = aggregated.get("contact_info", {})
+        if any(contact.values()):
+            compact["contact_info"] = contact
+
+        # Tables (first 5 only, rows capped)
+        tables = aggregated.get("tables", [])
+        if tables:
+            compact["tables"] = [
+                {"has_header": t.get("has_header"), "rows": t["rows"][:15]}
+                for t in tables[:5]
+            ]
+
+        # Structured data
+        structured = aggregated.get("structured_data", [])
+        if structured:
+            compact["structured_data"] = structured[:5]
+
+        # Links (just counts + first few)
+        links = aggregated.get("links", {})
+        compact["links_summary"] = {
+            "internal_count": len(links.get("internal", [])),
+            "external_count": len(links.get("external", [])),
+            "sample_internal": links.get("internal", [])[:10],
+            "sample_external": links.get("external", [])[:10],
+        }
+
+        # Images (just alt + src, first 10)
+        images = aggregated.get("images", [])
+        if images:
+            compact["images"] = [
+                {"src": img["src"], "alt": img.get("alt", "")}
+                for img in images[:10]
+            ]
+
+        raw = json.dumps(compact, ensure_ascii=False, default=str)
+        # Hard-cap to avoid token overflow
+        if len(raw) > self.MAX_TEXT_CHARS:
+            raw = raw[:self.MAX_TEXT_CHARS] + "...(truncated)"
+        return raw
+
+    # ── Utilities ──────────────────────────────────────────────────────
+
+    def _normalise_url(self, url: str) -> str:
+        url = url.strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return url
