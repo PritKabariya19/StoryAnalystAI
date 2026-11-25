@@ -13,7 +13,7 @@ const STEPS = [
     step: "02", icon: Globe, color: "from-purple-500 to-purple-700",
     title: "Explore Your Website",
     desc: "Provide a URL and let our crawler automatically discover pages, forms, navigation flows, and interactive elements.",
-    detail: "Powered by real browser crawling (Selenium) to capture dynamic content. Extracts CSS selectors, XPath, and accessibility metadata.",
+    detail: "Powered by real browser crawling (Playwright) to capture dynamic content. Extracts CSS selectors, XPath, and accessibility metadata.",
   },
   {
     step: "03", icon: Code2, color: "from-indigo-500 to-indigo-700",

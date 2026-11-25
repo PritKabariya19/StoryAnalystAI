@@ -1,9 +1,9 @@
 import axios from "axios";
 import { auth, isFirebaseConfigured } from "./firebase";
 
-const BASE_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
+const BASE_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:5001";
 
-/** Get current auth token (Local JWT preferred over Firebase) */
+/** Get current auth token. Only one session is active at a time: local JWT or Firebase. */
 async function getToken() {
   const localToken = localStorage.getItem("token");
   if (localToken) return localToken;
@@ -46,8 +46,8 @@ export const authSignup = (data) =>
 export const authLogin = (data) =>
   api.post("/api/auth/login", data).then((r) => r.data);
 
-export const authFirebaseLogin = (token) =>
-  api.post("/api/auth/firebase-login", { token }).then((r) => r.data);
+export const authMe = () =>
+  api.get("/api/auth/me").then((r) => r.data);
 
 // ─── AI Endpoints ─────────────────────────────────────────────────────────────
 export const generateStory = (requirement) =>
@@ -69,16 +69,17 @@ export const generateSmartTests = (url, query = "", user_story = "", depth = 1) 
 export const executeTests = (testCases, headless = true) =>
   api.post("/api/tests/execute", { test_cases: testCases, headless }).then((r) => r.data);
 
-export const startTestJob = (testCases, workers = 1) =>
-  api.post("/api/tests/start", { test_cases: testCases, workers }).then((r) => r.data);
+export const startTestJob = (testCases, workers = 1, headless = true) =>
+  api.post("/api/tests/start", { test_cases: testCases, workers, headless }).then((r) => r.data);
 
-export const startBatchTestJob = (testCases, { startIndex = 0, endIndex, batchSize = 5, workers = 1 } = {}) =>
+export const startBatchTestJob = (testCases, { startIndex = 0, endIndex, batchSize = 5, workers = 1, headless = true } = {}) =>
   api.post("/api/tests/start-batch", {
     test_cases:  testCases,
     start_index: startIndex,
     end_index:   endIndex,
     batch_size:  batchSize,
     workers,
+    headless,
   }).then((r) => r.data);
 
 export const pollTestJob = (jobId) =>
@@ -97,7 +98,6 @@ export const deleteReport = (id) =>
 export const generateHtmlReport = (results, summary) =>
   api.post("/api/reports/generate-html", { results, summary }, { responseType: 'text' }).then((r) => r.data);
 
-export const getDownloadHtmlUrl = () => `${BASE_URL}/api/reports/download-html`;
 
 // ─── Payment Endpoints ────────────────────────────────────────────────────────
 export const createRazorpayOrder = (plan) =>
