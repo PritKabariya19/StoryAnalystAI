@@ -310,3 +310,316 @@ class TestExecutorAgent:
 
         if not test_cases:
             return []
+        headless = self._resolve_headless(headless)
+        workers = max(1, min(int(workers), MAX_WORKERS, len(test_cases)))
+        self._shot_counter = 0
+
+        indexed: List[Tuple[int, dict]] = list(enumerate(test_cases))
+
+        if workers == 1:
+            raw = self._run_worker(indexed, headless, screenshots_dir)
+            return [r for _, r in sorted(raw, key=lambda x: x[0])]
+
+        chunk_size = math.ceil(len(indexed) / workers)
+        chunks = [indexed[i: i + chunk_size] for i in range(0, len(indexed), chunk_size)]
+
+        all_indexed: List[Tuple[int, dict]] = []
+        lock = threading.Lock()
+
+        def worker_task(chunk):
+            results = self._run_worker(chunk, headless, screenshots_dir)
+            with lock:
+                all_indexed.extend(results)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(worker_task, chunk) for chunk in chunks]
+            for f in as_completed(futures):
+                exc = f.exception()
+                if exc:
+                    print(f"[executor] Worker error: {exc}")
+
+        all_indexed.sort(key=lambda x: x[0])
+        return [r for _, r in all_indexed]
+
+    def execute_batch(
+        self,
+        test_cases:      List[dict],
+        start_index:     int  = 0,
+        end_index:       Optional[int] = None,
+        batch_size:      int  = 5,
+        headless:        bool = True,
+        workers:         int  = 1,
+        screenshots_dir: Optional[Path] = None,
+        on_batch_done=None,   # optional callback(batch_results, offset, total_done, total)
+    ) -> List[dict]:
+        """Execute a sub-range of test_cases in sequential batches of `batch_size`.
+
+        Args:
+            test_cases:    Full list of test-case dicts.
+            start_index:   0-based inclusive start (default 0).
+            end_index:     0-based exclusive end (default len(test_cases)).
+            batch_size:    How many tests to run per batch iteration.
+            headless:      Headless browser flag.
+            workers:       Parallel browser workers per batch.
+            screenshots_dir: Optional override for screenshot directory.
+            on_batch_done: Called after each batch with
+                           (batch_results, batch_start_offset, total_done, total_in_range).
+        Returns:
+            Flat list of all results in range order.
+        """
+        if screenshots_dir is None:
+            screenshots_dir = SCREENSHOTS_DIR
+        screenshots_dir = Path(screenshots_dir)
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clamp range
+        total_all = len(test_cases)
+        start_index = max(0, min(int(start_index), total_all))
+        if end_index is None:
+            end_index = total_all
+        end_index = max(start_index, min(int(end_index), total_all))
+        batch_size = max(1, int(batch_size))
+
+        in_range = test_cases[start_index:end_index]
+        total_in_range = len(in_range)
+
+        if total_in_range == 0:
+            return []
+
+        all_results: List[dict] = []
+        cursor = 0  # offset within in_range
+
+        while cursor < total_in_range:
+            batch = in_range[cursor: cursor + batch_size]
+            # Run this batch (may itself be parallel with `workers`)
+            batch_results = self.execute_all(
+                batch,
+                headless=headless,
+                workers=workers,
+                screenshots_dir=screenshots_dir,
+            )
+            all_results.extend(batch_results)
+            cursor += len(batch)
+
+            print(
+                f"[executor] Batch done — "
+                f"{cursor}/{total_in_range} of range "
+                f"[{start_index}:{end_index}]"
+            )
+
+            if on_batch_done is not None:
+                try:
+                    on_batch_done(
+                        batch_results,
+                        start_index + cursor - len(batch),  # absolute offset
+                        start_index + cursor,               # absolute done
+                        end_index - start_index,            # total in range
+                    )
+                except Exception as cb_exc:
+                    print(f"[executor] on_batch_done callback error: {cb_exc}")
+
+        return all_results
+
+    # ── Worker ─────────────────────────────────────────────────────────────
+
+    def _run_worker(
+        self,
+        indexed_cases: List[Tuple[int, dict]],
+        headless:      bool,
+        screenshots_dir: Path,
+    ) -> List[Tuple[int, dict]]:
+        results: List[Tuple[int, dict]] = []
+        # Playwright's sync API is not thread-safe: each worker owns its own
+        # instance and browser.
+        with sync_playwright() as pw:
+            browser: Optional[Browser] = None
+            for pos, (original_idx, tc) in enumerate(indexed_cases):
+                # (Re)start the browser if we don't have a live one.
+                if browser is None or not browser.is_connected():
+                    if browser is not None:
+                        print("[executor] browser session died — restarting")
+                    try:
+                        browser = pw.chromium.launch(headless=headless)
+                    except Exception as exc:
+                        # Can't start the browser: mark this and all remaining
+                        # TCs as Error instead of losing the worker's results.
+                        msg = f"Could not start browser: {str(exc)[:250]}"
+                        print(f"[executor] {msg}")
+                        for idx2, tc2 in indexed_cases[pos:]:
+                            results.append((idx2, self._error_result(tc2, msg).to_dict()))
+                        break
+
+                context = None
+                try:
+                    # A fresh context per test case: no shared cookies/storage.
+                    context = browser.new_context(
+                        viewport={"width": 1440, "height": 900},
+                    )
+                    page = self._new_page(context)
+                    result = self._execute_one(tc, page, screenshots_dir, headless)
+                except Exception as exc:
+                    result = self._error_result(tc, f"Browser error: {str(exc)[:250]}")
+                finally:
+                    if context is not None:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                results.append((original_idx, result.to_dict()))
+        return results
+
+    @staticmethod
+    def _error_result(tc: dict, msg: str) -> "ExecutionResult":
+        return ExecutionResult(
+            tc_id=tc.get("tc_id", "TC-???"), feature=tc.get("feature", ""),
+            user_role=tc.get("user_role", ""), condition=tc.get("condition", ""),
+            page_url=tc.get("page_url", "") or "", status="Error",
+            duration_seconds=0, error_message=msg, screenshot_path=None,
+            log=f"💥 {msg}",
+        )
+
+    # ── Page setup ─────────────────────────────────────────────────────────
+
+    def _new_page(self, context) -> Page:
+        # Default for every element action; keeps a missing element from
+        # blocking for Playwright's 30s default.
+        context.set_default_timeout(WAIT_TIMEOUT * 1000)
+        page = context.new_page()
+        page.on("dialog", self._handle_dialog)
+        return page
+
+    def _handle_dialog(self, dialog) -> None:
+        """Close a JS dialog and remember its text (so negative tests can match
+        error messages shown via alert()). Dismiss is OK for alert() and CANCEL
+        for confirm() — never auto-confirms a destructive action on the site
+        under test. beforeunload is accepted so navigation isn't cancelled."""
+        if dialog.type == "beforeunload":
+            dialog.accept()
+            return
+        text = (dialog.message or "").strip()
+        dialog.dismiss()
+        if text:
+            self._alert_texts.append(text)
+
+    # ── Page readiness / navigation ────────────────────────────────────────
+
+    def _wait_for_page(self, page: Page, max_wait: float = PAGE_SETTLE_MAX) -> None:
+        """Wait for the load event and for the DOM to have had no nodes
+        added/removed for 400ms (SPA finished rendering). Bounded by
+        max_wait in total."""
+        end = time.time() + max_wait
+        try:
+            page.wait_for_load_state("load", timeout=max(0.5, max_wait) * 1000)
+        except PlaywrightError:
+            pass
+        remaining_ms = int(max(0.0, end - time.time()) * 1000)
+        if remaining_ms < 100:
+            return
+        try:
+            page.evaluate(_SETTLE_JS, [400, remaining_ms])
+        except PlaywrightError:
+            pass
+
+    def _navigate(self, page: Page, url: str) -> bool:
+        """Load url and wait for it to settle. Returns True if the page load
+        hit PAGE_LOAD_TIMEOUT (we then continue with the partial page).
+        Network failures raise."""
+        timed_out = False
+        try:
+            # Don't block on slow third-party scripts/ads; readiness is
+            # handled by _wait_for_page().
+            page.goto(url, wait_until="domcontentloaded",
+                      timeout=PAGE_LOAD_TIMEOUT * 1000)
+        except PlaywrightTimeoutError:
+            timed_out = True
+            try:
+                page.evaluate("window.stop()")
+            except PlaywrightError:
+                pass
+        self._wait_for_page(page)
+        return timed_out
+
+    def _after_click(self, page: Page) -> None:
+        """Called by every click handler: let the page react."""
+        page.wait_for_timeout(100)
+        self._wait_for_page(page, CLICK_SETTLE_MAX)
+
+    @staticmethod
+    def _click(el: Locator, timeout: float = 2000) -> None:
+        """Click like a user; fall back to a DOM click if that isn't possible."""
+        try:
+            el.click(timeout=timeout)
+        except PlaywrightError:
+            el.evaluate("e => e.click()")
+
+    # ── CAPTCHA detection ──────────────────────────────────────────────────
+
+    def _detect_captcha(self, page) -> Optional[str]:
+        """Return a short description if the page shows an unsolved,
+        user-facing CAPTCHA, else None."""
+        try:
+            return page.evaluate(_CAPTCHA_DETECT_JS, list(_CAPTCHA_TEXT))
+        except Exception:
+            return None
+
+    def _wait_out_captcha(self, page, headless: bool, log_lines: List[str]) -> Optional[str]:
+        """If a CAPTCHA is showing: in headed mode, give a human
+        CAPTCHA_MANUAL_WAIT seconds to solve it in the browser window.
+        Returns the reason string if still blocked, else None."""
+        reason = self._detect_captcha(page)
+        if not reason:
+            return None
+        if headless:
+            return reason
+        log_lines.append(f"⚠ {reason} — waiting up to {CAPTCHA_MANUAL_WAIT}s for manual solve...")
+        print(f"[executor] {reason}. Solve it in the browser window "
+              f"(waiting up to {CAPTCHA_MANUAL_WAIT}s)...")
+        deadline = time.time() + CAPTCHA_MANUAL_WAIT
+        while time.time() < deadline:
+            page.wait_for_timeout(1000)
+            if not self._detect_captcha(page):
+                self._wait_for_page(page)
+                log_lines.append("✔ CAPTCHA solved manually")
+                return None
+        return reason
+
+    def _captcha_result(self, page, tc_id, feature, user_role, condition,
+                        page_url, start, screenshots_dir, log_lines, reason):
+        log_lines.append(
+            "✘ Blocked by CAPTCHA — automated steps cannot continue. "
+            "Test against a staging site with CAPTCHA disabled / test keys, "
+            "or enable 'Show browser window' to solve it manually."
+        )
+        shot = self._screenshot(page, tc_id, screenshots_dir)
+        return ExecutionResult(
+            tc_id=tc_id, feature=feature, user_role=user_role,
+            condition=condition, page_url=page_url,
+            status="Error",
+            duration_seconds=time.time() - start,
+            error_message=f"Blocked by CAPTCHA: {reason}",
+            screenshot_path=shot,
+            log="\n".join(log_lines),
+            block_reason="captcha_detected",
+            final_verdict="BLOCKED — site showed a CAPTCHA",
+            fields_filled=self._fill_log if self._fill_log else None,
+        )
+
+    # ── Execute one TC ──────────────────────────────────────────────────────
+
+    def _execute_one(
+        self,
+        tc:              dict,
+        page:            Page,
+        screenshots_dir: Path,
+        headless:        bool = True,
+    ) -> ExecutionResult:
+        tc_id     = tc.get("tc_id", "TC-???")
+        feature   = tc.get("feature", "")
+        user_role = tc.get("user_role", "")
+        condition = tc.get("condition", "")
+        page_url  = (tc.get("page_url") or "").strip()
+        steps     = tc.get("automation_steps", [])
+
+        if page_url:
+            if not page_url.startswith(("http://", "https://", "file://")):
+                # Default to http:// if somehow missing (e.g., user typed localhost:3000)
