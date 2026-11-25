@@ -1,0 +1,9 @@
+Django>=5.2,<6
+django-cors-headers>=4.9
+requests>=2.31
+PyJWT>=2.8
+bcrypt>=4.1
+python-dotenv>=1.0
+firebase-admin>=6.5
+stripe>=10
+gunicorn>=22
