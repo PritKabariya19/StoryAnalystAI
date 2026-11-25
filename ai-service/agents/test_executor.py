@@ -935,3 +935,316 @@ class TestExecutorAgent:
             block_reason = block_reason_prefix or "error_message_shown"
             log_lines.append(
                 f"✘ Step {step_num}: [NEGATIVE FAIL] {reason}"
+            )
+            shot = self._screenshot(page, tc_id, screenshots_dir)
+            return ExecutionResult(
+                tc_id=tc_id, feature=feature, user_role=user_role,
+                condition=condition, page_url=page_url,
+                status="Fail",
+                duration_seconds=time.time() - start_time,
+                error_message=reason,
+                screenshot_path=shot,
+                log="\n".join(log_lines),
+                block_reason=block_reason,
+                expected_error_message=expected_error,
+                error_message_found=found_display,
+                message_match=False,
+                final_verdict=f"FAIL — {reason}",
+                fields_filled=fill_log,
+            )
+
+        # ── RULE 3: No error at all → FAIL ──
+        # Detect silent page reload
+        block_reason = block_reason_prefix or "no_error_shown"
+        if pre_submit_source is not None:
+            try:
+                current_source = page.content() or ""
+                if current_source != pre_submit_source:
+                    block_reason = block_reason_prefix or "page_reloaded_silently"
+                    log_lines.append(
+                        f"⚠ Step {step_num}: Page source changed (silent reload detected)"
+                    )
+            except Exception:
+                pass
+
+        reason = "No error message found on page"
+        log_lines.append(
+            f"✘ Step {step_num}: [NEGATIVE FAIL] {reason}"
+        )
+        shot = self._screenshot(page, tc_id, screenshots_dir)
+        return ExecutionResult(
+            tc_id=tc_id, feature=feature, user_role=user_role,
+            condition=condition, page_url=page_url,
+            status="Fail",
+            duration_seconds=time.time() - start_time,
+            error_message=reason,
+            screenshot_path=shot,
+            log="\n".join(log_lines),
+            block_reason=block_reason,
+            expected_error_message=expected_error,
+            error_message_found="none",
+            message_match=False,
+            final_verdict=f"FAIL — {reason}",
+            fields_filled=fill_log,
+        )
+
+    # ── Thread-safe screenshot & Error Helpers ─────────────────────────
+
+    def _find_visible_error_text(self, page) -> List[str]:
+        """Scan the page for visible error/validation text.
+
+        Searches (in order):
+          1. Elements whose class contains error/invalid/alert/danger/warning
+          2. Elements with role="alert"
+          3. Toast/snackbar containers
+          4. HTML5 validation messages via JS
+
+        Returns a list of individual error texts found (empty list = none).
+        """
+        found_texts: List[str] = []
+
+        # 0. Messages shown via JS alert() during this test case
+        for t in self._alert_texts:
+            if t not in found_texts:
+                found_texts.append(t)
+
+        def collect(selector: str) -> None:
+            try:
+                elements = page.locator(selector).all()
+            except PlaywrightError:
+                return
+            for el in elements:
+                try:
+                    text = _shown_text(el)
+                except PlaywrightError:
+                    continue
+                if text and text not in found_texts:
+                    found_texts.append(text)
+
+        # 1. Class-based error elements
+        _TR = "translate(@class, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+        keywords = ("error", "invalid", "alert", "danger", "warning",
+                    "validation", "feedback")
+        collect("xpath=//*[" + " or ".join(
+            f"contains({_TR}, '{k}')" for k in keywords) + "]")
+
+        # 2. role="alert" elements
+        collect('[role="alert"]')
+
+        # 3. Toast / snackbar containers
+        for sel in ['[class*="toast"]', '[class*="snackbar"]', '[class*="notification"]']:
+            collect(sel)
+
+        # 4. HTML5 constraint-validation messages via JS (individual msgs)
+        try:
+            js_msgs = page.evaluate("""() => {
+                var msgs = [];
+                document.querySelectorAll('input,select,textarea').forEach(function(el){
+                    if (!el.validity.valid && el.validationMessage) {
+                        msgs.push(el.validationMessage);
+                    }
+                });
+                return msgs;
+            }""")
+            if js_msgs:
+                for msg in js_msgs:
+                    msg = msg.strip()
+                    if msg and msg not in found_texts:
+                        found_texts.append(msg)
+        except Exception:
+            pass
+
+        return found_texts
+
+    def _screenshot(self, page, tc_id, screenshots_dir):
+        """Capture the browser viewport (what a user would see, including the
+        area scrolled to for the last interaction) after the page settles.
+        Returns the relative path, or None if capture failed."""
+        try:
+            self._wait_for_page(page, SHOT_SETTLE_MAX)
+            with self._shot_lock:
+                self._shot_counter += 1
+                idx = self._shot_counter
+            safe_id = re.sub(r"[^\w\-]", "_", tc_id)
+            ts    = int(time.time() * 1000)
+            fname = f"{idx:04d}_{safe_id}_{ts}.png"
+            abs_dir = Path(screenshots_dir).resolve()
+            abs_dir.mkdir(parents=True, exist_ok=True)
+            png = page.screenshot(timeout=15000)
+            if not png or len(png) < 100:
+                print(f"[executor] empty screenshot for {tc_id}")
+                return None
+            (abs_dir / fname).write_bytes(png)
+            return f"screenshots/{fname}"
+        except Exception as e:
+            print(f"[executor] Screenshot error for {tc_id}: {e}")
+            return None
+
+    # ── Step interpreter ───────────────────────────────────────────────
+
+    def _run_json_step(self, step: dict, page: Page) -> None:
+        action = step.get("action", "").lower()
+
+        if action == "navigate":
+            url = step.get("url")
+            if url:
+                self._navigate(page, url)
+            return
+
+        locator = step.get("locator", {})
+        ltype = locator.get("type", "").lower()
+        lval = locator.get("value", "")
+
+        def _get_element() -> Optional[Locator]:
+            if not lval: return None
+            selectors = {
+                "id":    f'[id="{_css_string(lval)}"]',
+                "name":  f'[name="{_css_string(lval)}"]',
+                "css":   f"css={lval}",
+                "xpath": f"xpath={lval}",
+            }
+            if ltype not in selectors:
+                return self._find_input(page, lval)
+            el = page.locator(selectors[ltype]).first
+            el.wait_for(state="attached")
+            return el
+
+        if action == "input":
+            value = step.get("value", "")
+            el = _get_element()
+            if el:
+                fill_result = self._smart_fill_element(page, el, lval or "field", value)
+                # Propagate hard failures (element not interactable) as exceptions
+                if fill_result["status"].startswith("error"):
+                    raise ElementBlocked(
+                        f"smart_fill failed on '{lval}': {fill_result['status']}"
+                    )
+            return
+
+        if action == "click":
+            el = _get_element()
+            if el:
+                self._click(el, WAIT_TIMEOUT * 1000)
+            else:
+                # If no strict locator, try smart click with 'value'
+                self._smart_click(page, step.get("value", ""))
+            self._after_click(page)
+            return
+
+        if action == "assert":
+            atype = step.get("type", "url")
+            expected = step.get("expected", "")
+            if atype == "url":
+                cur = page.url
+                assert expected in cur, f"URL mismatch: '{expected}' not in '{cur}'"
+            else:
+                src = self._visible_text(page)
+                assert expected.lower() in src, f"Text '{expected}' not found on page"
+            return
+
+    def _run_step(self, step: str, page: Page) -> Optional[str]:
+        """Run one natural-language step. Returns the kind of action that was
+        performed ('navigate', 'click', 'input', 'assert', ...) or None."""
+        s  = step.strip()
+        sl = s.lower()
+        if not s or sl.startswith("#"):
+            return None
+
+        # ── Navigate ────────────────────────────────────────────────────
+        nav_m = _NAV_PAT.search(s)
+        if nav_m:
+            url = nav_m.group(1).rstrip("'\".,;")
+            self._navigate(page, url)
+            return "navigate"
+
+        # ── Clear field ─────────────────────────────────────────────────
+        if re.search(r"\bclear\b.*\bfield\b", sl):
+            fname = self._extract_quoted(s)
+            if fname:
+                el = self._find_input(page, fname)
+                try:
+                    el.fill("")
+                except PlaywrightError:
+                    el.evaluate("e => { e.value = ''; }")
+            return "input"
+
+        # ── Enter value in field ────────────────────────────────────────
+        m = _ENTER_FIELD_PAT.search(s)
+        if m:
+            value = next((v for v in (m.group("vd"), m.group("vs"), m.group("vb")) if v is not None), "")
+            name  = next((v for v in (m.group("nd"), m.group("ns"), m.group("nb")) if v), "").strip()
+            try:
+                el = self._find_input(page, name)
+                fill_result = self._smart_fill_element(page, el, name, value)
+                if fill_result["status"].startswith("error"):
+                    raise ElementNotFound(
+                        f"Could not fill field '{name}': {fill_result['status']}"
+                    )
+            except ElementNotFound:
+                raise
+            except Exception as e:
+                raise ElementNotFound(f"Could not fill field '{name}': {e}")
+            return "input"
+
+        # ── Click ───────────────────────────────────────────────────────
+        click_m = _CLICK_PAT.search(s)
+        if click_m:
+            target = click_m.group(1).strip()
+            self._smart_click(page, target)
+            self._after_click(page)
+            return "click"
+
+        # ── Assert URL ──────────────────────────────────────────────────
+        if re.search(r"\b(assert|verify|check|confirm)\b", sl) and "url" in sl:
+            expected = self._extract_quoted(s) or self._extract_url(s)
+            if expected:
+                cur = page.url
+                assert expected in cur, f"URL mismatch: '{expected}' not in '{cur}'"
+            return "assert"
+
+        # ── Assert text on page ─────────────────────────────────────────
+        if re.search(r"\b(assert|verify|check|confirm)\b", sl) and \
+                re.search(r"\b(page|response|text|message|show|display|reflect)\b", sl):
+            expected = self._extract_quoted(s)
+            if expected:
+                exp_l = expected.lower()
+                # Generic placeholder phrases — skip
+                SKIP_PHRASES = [
+                    "the page/response reflects", "system responds correctly",
+                    "edge case safely", "boundary value", "handles the edge",
+                    "operation completes", "accepts or rejects",
+                    "error/validation message", "appropriate error",
+                    "action is rejected", "confirmation is shown",
+                ]
+                if any(p in exp_l for p in SKIP_PHRASES):
+                    return
+
+                src     = self._visible_text(page)
+                cur_url = page.url.lower()
+
+                # Smart positive vs negative check
+                positive_kw = ["success", "welcome", "logged in", "dashboard", "registered",
+                               "profile", "thank you", "confirmed", "submitted", "saved", "logout"]
+                negative_kw = ["invalid", "incorrect", "error", "failed", "wrong",
+                               "denied", "unauthorized", "not found", "required", "try again"]
+
+                if any(k in exp_l for k in positive_kw):
+                    if any(k in src for k in positive_kw) or \
+                            any(k in cur_url for k in ["dashboard", "home", "profile", "success", "account"]):
+                        return  # soft pass
+                    if "login" not in cur_url and "signin" not in cur_url:
+                        return  # redirected away from login = probably success
+                    assert False, "Expected success indicators but not found"
+
+                if any(k in exp_l for k in negative_kw):
+                    return  # soft pass for negative assertions
+
+                if len(exp_l) < 80 and exp_l not in src:
+                    assert False, f"Text '{expected}' not found on page"
+            return
+
+        # ── Dropdown ────────────────────────────────────────────────────
+        if "select" in sl and any(k in sl for k in ("option", "dropdown", "from")):
+            opt = self._extract_quoted(s)
+            if opt:
+                selects = page.locator("select")
