@@ -1,20 +1,35 @@
 import { useState, useEffect } from "react";
 import { useNavigate, useSearchParams, Link } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Brain, Mail, Lock, User, Eye, EyeOff, AlertCircle, Chrome } from "lucide-react";
+import { Brain, AlertCircle } from "lucide-react";
 import useStore from "../state/store";
-import Button from "../components/Button";
+import AuthForm from "../components/auth/AuthForm";
+import GoogleButton from "../components/auth/GoogleButton";
 
 export default function Auth() {
   const [params] = useSearchParams();
   const [tab, setTab] = useState(params.get("tab") === "signup" ? "signup" : "login");
-  const [showPw, setShowPw] = useState(false);
   const [form, setForm] = useState({ name: "", email: "", password: "" });
 
-  const { login, signup, loginWithGoogle, authError, authLoading, user, addToast } = useStore();
+  const {
+    login, signup, loginWithGoogle, resetPassword, clearAuthError,
+    authError, authSubmitting, user, addToast,
+  } = useStore();
   const navigate = useNavigate();
 
   useEffect(() => { if (user) navigate("/dashboard", { replace: true }); }, [user]);
+
+  useEffect(() => { clearAuthError(); }, [tab]);
+
+  async function handleForgotPassword() {
+    if (!form.email.trim()) { addToast("Enter your email address first.", "error"); return; }
+    try {
+      await resetPassword(form.email.trim());
+      addToast("If an account exists for that email, a reset link has been sent.", "success");
+    } catch {
+      // Error in store
+    }
+  }
 
   function handleChange(e) {
     setForm((f) => ({ ...f, [e.target.name]: e.target.value }));
@@ -88,15 +103,7 @@ export default function Auth() {
           ))}
         </div>
 
-        {/* Google Sign-in */}
-        <button
-          onClick={handleGoogle}
-          disabled={authLoading}
-          className="w-full flex items-center justify-center gap-3 py-3 rounded-xl border border-surface-border text-sm font-medium text-white/70 hover:text-white hover:bg-white/10 transition-all mb-6"
-        >
-          <Chrome size={18} />
-          Continue with Google
-        </button>
+        <GoogleButton onClick={handleGoogle} disabled={authSubmitting} />
 
         <div className="flex items-center gap-3 mb-6">
           <div className="flex-1 h-px bg-surface-border" />
@@ -119,89 +126,14 @@ export default function Auth() {
           )}
         </AnimatePresence>
 
-        {/* Form */}
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <AnimatePresence>
-            {tab === "signup" && (
-              <motion.div
-                initial={{ opacity: 0, height: 0 }}
-                animate={{ opacity: 1, height: "auto" }}
-                exit={{ opacity: 0, height: 0 }}
-              >
-                <label className="block text-xs font-medium text-white/50 mb-1.5" htmlFor="name">
-                  Full Name
-                </label>
-                <div className="relative">
-                  <User size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30" />
-                  <input
-                    id="name"
-                    name="name"
-                    type="text"
-                    value={form.name}
-                    onChange={handleChange}
-                    placeholder="John Doe"
-                    required={tab === "signup"}
-                    className="input-field pl-10"
-                    autoComplete="name"
-                  />
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          <div>
-            <label className="block text-xs font-medium text-white/50 mb-1.5" htmlFor="email">
-              Email Address
-            </label>
-            <div className="relative">
-              <Mail size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30" />
-              <input
-                id="email"
-                name="email"
-                type="email"
-                value={form.email}
-                onChange={handleChange}
-                placeholder="you@example.com"
-                required
-                className="input-field pl-10"
-                autoComplete="email"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs font-medium text-white/50 mb-1.5" htmlFor="password">
-              Password
-            </label>
-            <div className="relative">
-              <Lock size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30" />
-              <input
-                id="password"
-                name="password"
-                type={showPw ? "text" : "password"}
-                value={form.password}
-                onChange={handleChange}
-                placeholder={tab === "signup" ? "Min 6 characters" : "Your password"}
-                required
-                minLength={tab === "signup" ? 6 : undefined}
-                className="input-field pl-10 pr-10"
-                autoComplete={tab === "signup" ? "new-password" : "current-password"}
-              />
-              <button
-                type="button"
-                onClick={() => setShowPw((v) => !v)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-white/30 hover:text-white/60 transition-colors"
-                aria-label={showPw ? "Hide password" : "Show password"}
-              >
-                {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
-            </div>
-          </div>
-
-          <Button type="submit" variant="primary" loading={authLoading} className="w-full mt-2">
-            {tab === "login" ? "Sign In" : "Create Account"}
-          </Button>
-        </form>
+        <AuthForm
+          tab={tab}
+          form={form}
+          onChange={handleChange}
+          onSubmit={handleSubmit}
+          onForgotPassword={handleForgotPassword}
+          submitting={authSubmitting}
+        />
 
         <p className="text-center text-xs text-white/30 mt-6">
           {tab === "login" ? "Don't have an account? " : "Already have an account? "}
