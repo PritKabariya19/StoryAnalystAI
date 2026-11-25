@@ -399,3 +399,405 @@ class WebsiteExplorerAgent:
         images = []
         for img in soup.find_all("img"):
             src = img.get("src") or img.get("data-src") or ""
+            if not src:
+                continue
+            full_src = urljoin(base, src)
+            images.append({
+                "src": full_src,
+                "alt": img.get("alt", ""),
+                "has_alt": bool(img.get("alt")),
+                "width": img.get("width", ""),
+                "height": img.get("height", ""),
+                "loading": img.get("loading", ""),
+            })
+            if len(images) >= self.MAX_IMAGES:
+                break
+        return images
+
+    # ── Links (enhanced) ───────────────────────────────────────────────────
+
+    def _get_links(self, soup: BeautifulSoup, base: str, base_domain: str) -> list:
+        seen = set()
+        links = []
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(strip=True)
+            href = a["href"].strip()
+            if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+                continue
+            full_href = urljoin(base, href)
+            if full_href not in seen:
+                seen.add(full_href)
+                link_domain = urlparse(full_href).netloc
+                links.append({
+                    "text": text or href,
+                    "href": full_href,
+                    "is_internal": link_domain == base_domain,
+                    "rel": a.get("rel", []),
+                    "target": a.get("target", ""),
+                })
+            if len(links) >= self.MAX_LINKS:
+                break
+        return links
+
+    # ── Navigation Structure ───────────────────────────────────────────────
+
+    def _get_navigations(self, soup: BeautifulSoup, base: str) -> list:
+        navs = []
+        for nav in soup.find_all("nav"):
+            nav_links = []
+            for a in nav.find_all("a", href=True):
+                text = a.get_text(strip=True)
+                if text:
+                    nav_links.append({
+                        "text": text,
+                        "href": urljoin(base, a["href"]),
+                    })
+            label = nav.get("aria-label") or nav.get("id") or "navigation"
+            navs.append({
+                "label": label,
+                "links": nav_links[:30],
+            })
+        return navs
+
+    # ── Tables ─────────────────────────────────────────────────────────────
+
+    def _get_tables(self, soup: BeautifulSoup) -> list:
+        tables = []
+        for table in soup.find_all("table"):
+            headers = []
+            for th in table.find_all("th"):
+                text = th.get_text(strip=True)
+                if text:
+                    headers.append(text)
+            rows = len(table.find_all("tr"))
+            tables.append({
+                "id": table.get("id", ""),
+                "class": " ".join(table.get("class", [])),
+                "headers": headers[:20],
+                "row_count": rows,
+                "has_caption": bool(table.find("caption")),
+            })
+            if len(tables) >= 10:
+                break
+        return tables
+
+    # ── Interactive Elements ───────────────────────────────────────────────
+
+    def _get_interactive_elements(self, soup: BeautifulSoup) -> list:
+        elements = []
+
+        # Dropdowns (standalone selects not in forms)
+        for sel in soup.find_all("select"):
+            if not sel.find_parent("form"):
+                options_count = len(sel.find_all("option"))
+                elements.append({
+                    "type": "dropdown",
+                    "name": sel.get("name") or sel.get("id") or "select",
+                    "options_count": options_count,
+                })
+
+        # Details/Summary (accordions)
+        for det in soup.find_all("details"):
+            summary = det.find("summary")
+            elements.append({
+                "type": "accordion",
+                "summary": summary.get_text(strip=True) if summary else "",
+                "open": det.has_attr("open"),
+            })
+
+        # Dialog elements (modals)
+        for dlg in soup.find_all("dialog"):
+            elements.append({
+                "type": "dialog/modal",
+                "id": dlg.get("id", ""),
+                "open": dlg.has_attr("open"),
+            })
+
+        # Tabs (role="tab")
+        tabs = soup.find_all(attrs={"role": "tab"})
+        if tabs:
+            tab_texts = [t.get_text(strip=True) for t in tabs[:10]]
+            elements.append({
+                "type": "tab_group",
+                "tabs": tab_texts,
+                "count": len(tabs),
+            })
+
+        # Tooltips / popovers
+        for el in soup.find_all(attrs={"data-toggle": "tooltip"}):
+            elements.append({
+                "type": "tooltip",
+                "text": el.get("title") or el.get_text(strip=True)[:80],
+            })
+            if len(elements) >= 30:
+                break
+
+        return elements[:30]
+
+    # ── Media ──────────────────────────────────────────────────────────────
+
+    def _get_media(self, soup: BeautifulSoup, base: str) -> list:
+        media = []
+        for video in soup.find_all("video"):
+            src = video.get("src") or ""
+            source = video.find("source")
+            if source:
+                src = source.get("src", src)
+            media.append({
+                "type": "video",
+                "src": urljoin(base, src) if src else "",
+                "has_controls": video.has_attr("controls"),
+                "autoplay": video.has_attr("autoplay"),
+            })
+
+        for audio in soup.find_all("audio"):
+            src = audio.get("src") or ""
+            source = audio.find("source")
+            if source:
+                src = source.get("src", src)
+            media.append({
+                "type": "audio",
+                "src": urljoin(base, src) if src else "",
+            })
+
+        for iframe in soup.find_all("iframe"):
+            src = iframe.get("src", "")
+            media.append({
+                "type": "iframe",
+                "src": src,
+                "title": iframe.get("title", ""),
+                "width": iframe.get("width", ""),
+                "height": iframe.get("height", ""),
+            })
+        return media[:20]
+
+    # ── Tech Stack Detection ─────────────────────────────────────────────
+
+    def _detect_tech_stack(self, html: str, soup: BeautifulSoup) -> list:
+        detected = []
+        html_lower = html.lower()
+
+        for tech, patterns in self.TECH_SIGNATURES.items():
+            for pattern in patterns:
+                if re.search(pattern, html_lower):
+                    detected.append(tech)
+                    break
+
+        # Check script sources for additional signals
+        for script in soup.find_all("script", src=True):
+            src = script.get("src", "").lower()
+            if "react" in src and "React" not in detected:
+                detected.append("React")
+            if "vue" in src and "Vue.js" not in detected:
+                detected.append("Vue.js")
+            if "angular" in src and "Angular" not in detected:
+                detected.append("Angular")
+            if "jquery" in src and "jQuery" not in detected:
+                detected.append("jQuery")
+            if "bootstrap" in src and "Bootstrap" not in detected:
+                detected.append("Bootstrap")
+
+        return sorted(set(detected))
+
+    # ── Accessibility Audit ─────────────────────────────────────────────
+
+    def _audit_accessibility(self, soup: BeautifulSoup) -> list:
+        issues = []
+
+        # Check lang attribute
+        html_tag = soup.find("html")
+        if not html_tag or not html_tag.get("lang"):
+            issues.append({
+                "type": "missing_lang",
+                "severity": "high",
+                "message": "HTML tag is missing 'lang' attribute",
+            })
+
+        # Check images without alt text
+        imgs_without_alt = 0
+        for img in soup.find_all("img"):
+            if not img.get("alt") and not img.get("role") == "presentation":
+                imgs_without_alt += 1
+        if imgs_without_alt > 0:
+            issues.append({
+                "type": "missing_alt",
+                "severity": "high",
+                "message": f"{imgs_without_alt} image(s) missing 'alt' attribute",
+                "count": imgs_without_alt,
+            })
+
+        # Check form inputs without labels
+        inputs_without_labels = 0
+        for inp in soup.find_all(["input", "select", "textarea"]):
+            inp_type = inp.get("type", "text").lower()
+            if inp_type in ("hidden", "submit", "button", "image", "reset"):
+                continue
+            inp_id = inp.get("id")
+            has_label = False
+            if inp_id:
+                label = soup.find("label", attrs={"for": inp_id})
+                if label:
+                    has_label = True
+            if not has_label and not inp.get("aria-label") and not inp.get("aria-labelledby"):
+                # Check if wrapped in a label
+                if not inp.find_parent("label"):
+                    inputs_without_labels += 1
+        if inputs_without_labels > 0:
+            issues.append({
+                "type": "missing_labels",
+                "severity": "high",
+                "message": f"{inputs_without_labels} form input(s) missing associated labels",
+                "count": inputs_without_labels,
+            })
+
+        # Check heading hierarchy
+        headings = [int(h.name[1]) for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])]
+        h1_count = headings.count(1)
+        if h1_count == 0:
+            issues.append({
+                "type": "no_h1",
+                "severity": "medium",
+                "message": "Page has no H1 heading",
+            })
+        elif h1_count > 1:
+            issues.append({
+                "type": "multiple_h1",
+                "severity": "low",
+                "message": f"Page has {h1_count} H1 headings (recommend only 1)",
+            })
+
+        # Check for skipped heading levels
+        for i in range(1, len(headings)):
+            if headings[i] > headings[i-1] + 1:
+                issues.append({
+                    "type": "skipped_heading",
+                    "severity": "medium",
+                    "message": f"Heading level skipped: h{headings[i-1]} → h{headings[i]}",
+                })
+                break
+
+        # Check for missing skip navigation
+        skip_link = soup.find("a", href="#main") or soup.find("a", href="#content") or soup.find("a", class_="skip-link")
+        main_content = soup.find("main") or soup.find(id="main-content") or soup.find(id="content")
+        if not skip_link and not main_content:
+            issues.append({
+                "type": "no_skip_nav",
+                "severity": "low",
+                "message": "No skip navigation link or <main> landmark found",
+            })
+
+        # Check for links without text
+        empty_links = 0
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(strip=True)
+            if not text and not a.get("aria-label") and not a.find("img"):
+                empty_links += 1
+        if empty_links > 0:
+            issues.append({
+                "type": "empty_links",
+                "severity": "medium",
+                "message": f"{empty_links} link(s) have no text or aria-label",
+                "count": empty_links,
+            })
+
+        # Check for buttons without accessible names
+        unnamed_buttons = 0
+        for btn in soup.find_all("button"):
+            text = btn.get_text(strip=True)
+            if not text and not btn.get("aria-label") and not btn.get("title"):
+                unnamed_buttons += 1
+        if unnamed_buttons > 0:
+            issues.append({
+                "type": "unnamed_buttons",
+                "severity": "medium",
+                "message": f"{unnamed_buttons} button(s) have no accessible name",
+                "count": unnamed_buttons,
+            })
+
+        return issues
+
+    # ── Page Statistics ────────────────────────────────────────────────────
+
+    def _get_statistics(self, soup: BeautifulSoup) -> dict:
+        text = soup.get_text(separator=" ", strip=True)
+        words = len(text.split())
+        total_elements = len(soup.find_all(True))
+
+        return {
+            "word_count": words,
+            "total_elements": total_elements,
+            "total_forms": len(soup.find_all("form")),
+            "total_links": len(soup.find_all("a", href=True)),
+            "total_images": len(soup.find_all("img")),
+            "total_scripts": len(soup.find_all("script")),
+            "total_stylesheets": len(soup.find_all("link", rel="stylesheet")),
+            "has_footer": bool(soup.find("footer")),
+            "has_header": bool(soup.find("header")),
+            "has_nav": bool(soup.find("nav")),
+            "has_main": bool(soup.find("main")),
+            "has_aside": bool(soup.find("aside")),
+        }
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SITE-WIDE SUMMARY
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _build_site_summary(self, pages: list) -> dict:
+        total_forms = sum(len(p.get("forms", [])) for p in pages)
+        total_fields = sum(
+            len(f.get("fields", []))
+            for p in pages
+            for f in p.get("forms", [])
+        )
+        total_links = sum(len(p.get("links", [])) for p in pages)
+        total_images = sum(len(p.get("images", [])) for p in pages)
+        total_buttons = sum(len(p.get("buttons", [])) for p in pages)
+        total_standalone = sum(len(p.get("standalone_inputs", [])) for p in pages)
+        total_tables = sum(len(p.get("tables", [])) for p in pages)
+        total_media = sum(len(p.get("media", [])) for p in pages)
+        total_navs = sum(len(p.get("navigations", [])) for p in pages)
+        total_interactive = sum(len(p.get("interactive_elements", [])) for p in pages)
+
+        # Aggregate tech stack across pages
+        all_tech = set()
+        for p in pages:
+            all_tech.update(p.get("tech_stack", []))
+
+        # Aggregate accessibility issues
+        all_a11y = []
+        for p in pages:
+            for issue in p.get("accessibility_issues", []):
+                issue_copy = dict(issue)
+                issue_copy["page_url"] = p.get("url", "")
+                all_a11y.append(issue_copy)
+
+        # Count error pages
+        error_pages = sum(1 for p in pages if p.get("error"))
+
+        return {
+            "total_pages": len(pages),
+            "error_pages": error_pages,
+            "total_forms": total_forms,
+            "total_fields": total_fields,
+            "total_links": total_links,
+            "total_images": total_images,
+            "total_buttons": total_buttons,
+            "total_standalone": total_standalone,
+            "total_tables": total_tables,
+            "total_media": total_media,
+            "total_navigations": total_navs,
+            "total_interactive_elements": total_interactive,
+            "detected_tech_stack": sorted(all_tech),
+            "total_accessibility_issues": len(all_a11y),
+            "accessibility_issues": all_a11y[:50],  # cap
+        }
+
+    # ══════════════════════════════════════════════════════════════════════
+    # UTILITIES
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _normalise(self, url: str) -> str:
+        url = url.strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return url
