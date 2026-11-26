@@ -4,66 +4,75 @@ import requests
 from django.conf import settings
 from django.http import JsonResponse
 
-from ai import mocks
-from core import firebase
+from ai import mocks, usage
 from core.http import api, error, is_blank, to_int, upstream_error
 
 log = logging.getLogger(__name__)
 
-PLAN_LIMITS = {"free": 10, "pro": 100, "premium": 9999}
+AI_TIMEOUT = 300  # seconds; a large Gemini request can take several minutes
 
 
-def _check_and_increment_usage(uid):
-    """Check and bump the user's usage count in Firestore."""
-    try:
-        firestore = firebase.db()
-        if firestore is None:
-            return {"allowed": True}  # mock mode
-
-        ref = firestore.collection("users").document(uid)
-        snapshot = ref.get()
-        if not snapshot.exists:
-            ref.set({"plan": "free", "usageCount": 0}, merge=True)
-            return {"allowed": True}
-
-        data = snapshot.to_dict()
-        plan = data.get("plan", "free")
-        count = data.get("usageCount") or 0
-        limit = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
-        if count >= limit:
-            return {"allowed": False, "plan": plan, "usageCount": count, "limit": limit}
-
-        ref.update({"usageCount": count + 1})
-        return {"allowed": True, "plan": plan, "usageCount": count + 1}
-    except Exception as exc:
-        log.warning("Firestore tracking disabled or failed (checking local fallback). %s", exc)
-        return {"allowed": True}
+class UpstreamFailed(Exception):
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.status = status
 
 
 def _proxy_to_python(path, body):
-    """Return the Python service's JSON, or None if the call failed."""
+    """Return the Python service's JSON, or raise UpstreamFailed."""
     try:
         response = requests.post(
             f"{settings.PYTHON_AI_URL}{path}",
             json=body,
             headers={"X-Internal-Secret": settings.INTERNAL_API_SECRET},
-            timeout=120,
+            timeout=AI_TIMEOUT,
         )
-        if not response.ok:
-            log.warning("[AI] %s failed: %s", path, upstream_error(response) or response.status_code)
-            return None
-        return response.json()
+        if response.ok:
+            return response.json()
+        detail = upstream_error(response) or f"status {response.status_code}"
+        status = 400 if response.status_code == 400 else 502
+        raise UpstreamFailed(f"The AI service could not complete the request: {detail}", status)
+    except requests.Timeout:
+        raise UpstreamFailed("The AI service took too long to respond. Please try again.", 504)
     except (requests.RequestException, ValueError) as exc:
         log.warning("[AI] %s unavailable: %s", path, exc)
-        return None
+        raise UpstreamFailed("The AI service is unavailable. Please try again.")
+
+
+def _generate(request, path, body, demo_data):
+    """Run one generation. It counts against the plan only if it succeeds."""
+    uid = request.user_claims["uid"]
+    try:
+        reserved = usage.reserve(uid)
+    except Exception:
+        log.exception("[AI] Could not check usage")
+        return error("Could not check your usage limit. Please try again.", 503)
+    if not reserved["allowed"]:
+        return error(
+            f"Usage limit reached. You have used {reserved['usageCount']}/{reserved['limit']} generations "
+            f"on the {reserved['plan']} plan. Please upgrade.",
+            429,
+            upgradeRequired=True,
+        )
+
+    try:
+        data = _proxy_to_python(path, body)
+    except UpstreamFailed as exc:
+        log.warning("[AI] %s failed: %s", path, exc)
+        try:
+            usage.refund(uid)
+        except Exception:
+            log.exception("[AI] Could not refund usage")
+        if settings.AI_DEMO_DATA:
+            return JsonResponse({**demo_data(), "mock": True, "mockNote": mocks.MOCK_NOTE})
+        return error(str(exc), exc.status)
+
+    used = {"usageCount": reserved["usageCount"]} if "usageCount" in reserved else {}
+    return JsonResponse({**data, "mock": False, **used})
 
 
 def _depth(request):
     return min(to_int(request.json.get("depth", 1), 1), 2)
-
-
-def _limit_reached():
-    return error("Usage limit reached.", 429, upgradeRequired=True)
 
 
 @api("POST", auth=True)
@@ -71,26 +80,8 @@ def generate_story(request):
     requirement = request.json.get("requirement")
     if is_blank(requirement):
         return error("Requirement text is required.", 400)
-
-    usage = _check_and_increment_usage(request.user_claims["uid"])
-    if not usage["allowed"]:
-        return error(
-            f"Usage limit reached. You have used {usage['usageCount']}/{usage['limit']} generations "
-            f"on the {usage['plan']} plan. Please upgrade.",
-            429,
-            upgradeRequired=True,
-        )
-    used = {"usageCount": usage["usageCount"]} if "usageCount" in usage else {}
-
-    data = _proxy_to_python("/analyze", {"story": requirement})
-    if data is not None:
-        return JsonResponse({**data, "mock": False, **used})
-    return JsonResponse({
-        "analysis": mocks.user_stories(requirement),
-        "mock": True,
-        "mockNote": mocks.MOCK_NOTE,
-        **used,
-    })
+    return _generate(request, "/analyze", {"story": requirement},
+                     lambda: mocks.story_analysis(requirement))
 
 
 @api("POST", auth=True)
@@ -98,13 +89,8 @@ def explore_website(request):
     url = request.json.get("url")
     if is_blank(url):
         return error("URL is required.", 400)
-    if not _check_and_increment_usage(request.user_claims["uid"])["allowed"]:
-        return _limit_reached()
-
-    data = _proxy_to_python("/explore", {"url": url, "depth": _depth(request)})
-    if data is not None:
-        return JsonResponse({**data, "mock": False})
-    return JsonResponse(mocks.exploration(url))
+    return _generate(request, "/explore", {"url": url, "depth": _depth(request)},
+                     lambda: mocks.exploration(url))
 
 
 @api("POST", auth=True)
@@ -112,41 +98,27 @@ def combined(request):
     requirement, url = request.json.get("requirement"), request.json.get("url")
     if is_blank(requirement) or is_blank(url):
         return error("Both requirement and URL are required.", 400)
-    if not _check_and_increment_usage(request.user_claims["uid"])["allowed"]:
-        return _limit_reached()
-
-    data = _proxy_to_python("/generate-combined", {"story": requirement, "url": url, "depth": _depth(request)})
-    if data is not None:
-        return JsonResponse({**data, "mock": False})
-    return JsonResponse(mocks.combined(requirement, url))
+    return _generate(request, "/generate-combined",
+                     {"story": requirement, "url": url, "depth": _depth(request)},
+                     lambda: mocks.combined(requirement, url))
 
 
 @api("POST", auth=True)
 def extract_info(request):
-    url, query = request.json.get("url"), request.json.get("query", "")
-    if is_blank(url):
+    url, query = request.json.get("url"), request.json.get("query") or ""
+    if is_blank(url) or not isinstance(query, str):
         return error("URL is required.", 400)
-    if not _check_and_increment_usage(request.user_claims["uid"])["allowed"]:
-        return _limit_reached()
-
-    data = _proxy_to_python("/extract", {"url": url, "query": query or "", "depth": _depth(request)})
-    if data is not None:
-        return JsonResponse({**data, "mock": False})
-    return JsonResponse(mocks.extraction(url, query))
+    return _generate(request, "/extract", {"url": url, "query": query, "depth": _depth(request)},
+                     lambda: mocks.extraction(url, query))
 
 
 @api("POST", auth=True)
 def smart_tests(request):
     url = request.json.get("url")
-    query, user_story = request.json.get("query", ""), request.json.get("user_story", "")
-    if is_blank(url):
-        return error("URL is required.", 400)
-    if not _check_and_increment_usage(request.user_claims["uid"])["allowed"]:
-        return _limit_reached()
-
-    data = _proxy_to_python("/generate-smart-tests", {
-        "url": url, "query": query or "", "user_story": user_story or "", "depth": _depth(request),
-    })
-    if data is not None:
-        return JsonResponse({**data, "mock": False})
-    return JsonResponse(mocks.smart_tests(url, query, user_story))
+    query = request.json.get("query") or ""
+    user_story = request.json.get("user_story") or ""
+    if is_blank(url) or not all(isinstance(v, str) for v in (query, user_story)):
+        return error("URL is required, and query and user_story must be text.", 400)
+    return _generate(request, "/generate-smart-tests",
+                     {"url": url, "query": query, "user_story": user_story, "depth": _depth(request)},
+                     lambda: mocks.smart_tests(url, query, user_story))

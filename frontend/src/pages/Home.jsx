@@ -36,7 +36,7 @@ const PRICING = [
   {
     name: "Pro",
     price: "₹199",
-    period: "/month",
+    period: " one-time",
     badge: "Most Popular",
     features: ["100 generations/month", "All Free features", "Combined Generator", "Test Executor", "PDF Reports", "Priority Support"],
     cta: "Upgrade to Pro",
@@ -47,7 +47,7 @@ const PRICING = [
   {
     name: "Premium",
     price: "₹499",
-    period: "/month",
+    period: " one-time",
     features: ["Unlimited generations", "All Pro features", "Advanced Analytics", "API Access", "Dedicated Support", "Custom Integrations"],
     cta: "Go Premium",
     href: "/subscription",

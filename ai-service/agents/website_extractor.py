@@ -22,10 +22,9 @@ from typing import List, Optional
 import requests
 from bs4 import BeautifulSoup, Comment
 
-import google.generativeai as genai
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from agents import llm
+from agents.url_guard import check_url, request_proxies, with_scheme
 
-genai.configure(api_key=GEMINI_API_KEY)
 
 
 class WebsiteExtractorAgent:
@@ -132,17 +131,21 @@ class WebsiteExtractorAgent:
 
     def _extract_page(self, url: str) -> dict:
         try:
+            check_url(url)
             resp = requests.get(
                 url, headers=self.HEADERS,
                 timeout=self.TIMEOUT, verify=False,
+                proxies=request_proxies(),
             )
             resp.raise_for_status()
             html = resp.text
+            final_url = resp.url  # after any redirect
         except requests.RequestException as exc:
             return {"url": url, "error": str(exc)}
 
         soup = BeautifulSoup(html, "html.parser")
-        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        base_tag = soup.find("base", href=True)
+        base = urljoin(final_url, base_tag["href"]) if base_tag else final_url
 
         return {
             "url":             url,
@@ -502,9 +505,7 @@ class WebsiteExtractorAgent:
         )
 
         try:
-            model = genai.GenerativeModel(model_name=GEMINI_MODEL)
-            response = model.generate_content(prompt)
-            return response.text.strip()
+            return llm.generate(prompt)
         except Exception as exc:
             return f"⚠️ AI summarization failed: {str(exc)[:200]}"
 
@@ -572,7 +573,4 @@ class WebsiteExtractorAgent:
     # ── Utilities ──────────────────────────────────────────────────────
 
     def _normalise_url(self, url: str) -> str:
-        url = url.strip()
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        return url
+        return with_scheme(url)

@@ -41,9 +41,20 @@ class RuleAnalyst:
         return StoryAnalysis(feature=feature, user_role=role, conditions=conditions, original_story=user_story)
 
     def _detect_feature(self, sl):
+        """The feature named first in what the user wants to do. The role
+        ("as an admin") and the reason ("so that I can sign in") don't count."""
+        action = re.sub(r"^\s*as an?\s.*?(?=\bi\s+(?:want|would|can|need)\b)", "", sl, flags=re.S)
+        action = action.split("so that")[0]
+        found = []
         for name, kws in self.FEATURE_KEYWORDS.items():
-            if any(kw in sl for kw in kws):
-                return name
+            for kw in kws:
+                # whole words, allowing "reset my password" and "bookings"
+                words = r"\s+(?:(?:my|the|a|an|their)\s+)?".join(map(re.escape, kw.split()))
+                m = re.search(rf"\b{words}(?:s|es|ed|ing)?\b", action)
+                if m:
+                    found.append((m.start(), -len(m.group()), name))
+        if found:
+            return min(found)[2]
         m = re.search(r"(?:want to|able to|can)\s+([a-zA-Z\s]{3,25}?)(?:\s+so that|\.|$)", sl)
         return m.group(1).strip().title() if m else "Feature"
 

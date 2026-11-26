@@ -17,7 +17,7 @@ async function getToken() {
 }
 
 /** Axios instance */
-const api = axios.create({ baseURL: BASE_URL, timeout: 180000 });
+const api = axios.create({ baseURL: BASE_URL, timeout: 330000 }); // longer than the backend's AI timeout
 
 /** Attach auth token to every request */
 api.interceptors.request.use(async (config) => {

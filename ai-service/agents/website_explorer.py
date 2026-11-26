@@ -5,6 +5,8 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, sync_playwright
 
+from agents.url_guard import BlockedURL, browser_options, check_url, with_scheme
+
 
 class WebsiteExplorerAgent:
     """
@@ -70,7 +72,7 @@ class WebsiteExplorerAgent:
         pages = []
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch()
+            browser = pw.chromium.launch(**browser_options())
             # Certificate errors are ignored so staging sites can be explored.
             context = browser.new_context(
                 user_agent=self.USER_AGENT, locale="en-US",
@@ -114,7 +116,13 @@ class WebsiteExplorerAgent:
         status_code = None
         error_msg = None
 
-        for attempt in range(self.MAX_RETRIES):
+        retries = self.MAX_RETRIES
+        try:
+            check_url(url)
+        except BlockedURL as exc:
+            error_msg, retries = str(exc), 0
+
+        for attempt in range(retries):
             page = context.new_page()
             try:
                 resp = page.goto(url, wait_until="domcontentloaded",
@@ -129,6 +137,7 @@ class WebsiteExplorerAgent:
                     except PlaywrightError:
                         pass  # busy pages never go idle; use what rendered
                     html = page.content()
+                    final_url = page.url  # after any redirect
                     break
             except PlaywrightError as exc:
                 error_msg = str(exc)
@@ -150,8 +159,9 @@ class WebsiteExplorerAgent:
             }
 
         soup = BeautifulSoup(html, "html.parser")
-        base = "{uri.scheme}://{uri.netloc}".format(uri=urlparse(url))
-        base_domain = urlparse(url).netloc
+        base_tag = soup.find("base", href=True)
+        base = urljoin(final_url, base_tag["href"]) if base_tag else final_url
+        base_domain = urlparse(final_url).netloc
 
         return {
             "url": url,
@@ -797,7 +807,4 @@ class WebsiteExplorerAgent:
     # ══════════════════════════════════════════════════════════════════════
 
     def _normalise(self, url: str) -> str:
-        url = url.strip()
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        return url
+        return with_scheme(url)

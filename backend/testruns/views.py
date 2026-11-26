@@ -16,7 +16,9 @@ def _run_options(request):
     test_cases = request.json.get("test_cases")
     workers = max(1, min(to_int(request.json.get("workers", 1), 1), 8))
     headless = request.json.get("headless", True) is not False
-    return test_cases if isinstance(test_cases, list) else [], workers, headless
+    if not isinstance(test_cases, list) or not all(isinstance(tc, dict) for tc in test_cases):
+        test_cases = []
+    return test_cases, workers, headless
 
 
 @api("POST", auth=True)
@@ -38,7 +40,7 @@ def start(request):
     test_cases, workers, headless = _run_options(request)
     if not test_cases:
         return error("No test cases provided.", 400)
-    job_id = jobs.create(len(test_cases), trickle=True)
+    job_id = jobs.create(len(test_cases), trickle=True, owner=request.user_claims["uid"])
     jobs.run_single_in_background(job_id, test_cases, workers, headless)
     return JsonResponse({"jobId": job_id, "status": "running", "total": len(test_cases)})
 
@@ -49,9 +51,12 @@ def start_batch(request):
     if not test_cases:
         return error("No test cases provided.", 400)
 
-    start_index = to_int(request.json.get("start_index", 0), 0)
-    end_index = to_int(request.json.get("end_index"), len(test_cases))
-    total = max(0, end_index - start_index)
+    count = len(test_cases)
+    start_index = max(0, min(to_int(request.json.get("start_index", 0), 0), count))
+    end_index = max(start_index, min(to_int(request.json.get("end_index"), count), count))
+    total = end_index - start_index
+    if not total:
+        return error("The batch range contains no test cases.", 400)
 
     try:
         response = requests.post(
@@ -73,7 +78,7 @@ def start_batch(request):
         log.error("[tests/start-batch] Could not start Python job: %s", exc)
         return error("Failed to start batch job: " + jobs.failure_message(exc), 500)
 
-    job_id = jobs.create(total)
+    job_id = jobs.create(total, owner=request.user_claims["uid"])
     jobs.poll_batch_in_background(job_id, python_job_id)
     return JsonResponse({"jobId": job_id, "status": "running", "total": total})
 
@@ -81,7 +86,7 @@ def start_batch(request):
 @api("GET", auth=True)
 def status(request, job_id):
     job = jobs.jobs.get(job_id)
-    if job is None:
+    if job is None or job["owner"] != request.user_claims["uid"]:
         return error("Job not found or expired.", 404)
     return JsonResponse({
         "status": job["status"],
@@ -96,7 +101,8 @@ def status(request, job_id):
 @api("GET")
 def screenshot(request, filename):
     """Serve a screenshot from local disk, falling back to the Python service.
-    Unauthenticated because <img> tags cannot send a bearer token."""
+    <img> tags cannot send a bearer token, so the random part of the file name
+    is what keeps a screenshot private."""
     if filename in (".", "..") or "\\" in filename or "\0" in filename:
         return error("Screenshot not found.", 404)
 
@@ -106,7 +112,8 @@ def screenshot(request, filename):
 
     try:
         upstream = requests.get(
-            f"{settings.PYTHON_AI_URL}/screenshots/{quote(filename)}", stream=True, timeout=10
+            f"{settings.PYTHON_AI_URL}/screenshots/{quote(filename)}",
+            headers=jobs.headers(), stream=True, timeout=10
         )
         upstream.raise_for_status()
     except requests.RequestException as exc:

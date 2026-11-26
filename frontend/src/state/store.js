@@ -40,9 +40,29 @@ async function loadProfile(set, get) {
 async function startLocalSession(set, get, { user, token }) {
   localStorage.setItem("token", token);
   if (isFirebaseConfigured && auth.currentUser) await authService.signOutFirebase();
+  if (get().user?.uid !== user.uid) set(SESSION_DEFAULTS);
   set({ user: fromLocal(user), plan: user.plan || "free", usageCount: 0 });
   loadProfile(set, get);
 }
+
+/** Everything that belongs to the signed-in user. Cleared when the session ends. */
+const SESSION_DEFAULTS = {
+  storyOutput: null,
+  explorerOutput: null,
+  smartTestOutput: null,
+  combinedOutput: null,
+  testResults: null,
+  generatedTests: [],
+  executedResults: [],
+  generationLoading: false,
+  generationError: null,
+  activeReports: [],
+  globalUrl: "",
+  globalQuery: "",
+  globalUserStory: "",
+  globalRequirement: "",
+  globalDepth: 1,
+};
 
 // ─── Zustand Store ────────────────────────────────────────────────────────────
 const useStore = create(
@@ -60,23 +80,8 @@ const useStore = create(
       theme: "dark",
       toasts: [],
 
-      // ── Generation State ──────────────────────────────────────────────────────
-      storyOutput: null,
-      explorerOutput: null,
-      smartTestOutput: null,
-      testResults: null,
-      generatedTests: [],
-      executedResults: [],
-      generationLoading: false,
-      generationError: null,
-      activeReports: [],
-
-      // ── Input State ───────────────────────────────────────────────────────────
-      globalUrl: "",
-      globalQuery: "",
-      globalUserStory: "",
-      globalRequirement: "",
-      globalDepth: 1,
+      // ── Generation and Input State ────────────────────────────────────────────
+      ...SESSION_DEFAULTS,
 
       setGlobalUrl: (url) => set({ globalUrl: url }),
       setGlobalQuery: (query) => set({ globalQuery: query }),
@@ -104,6 +109,7 @@ const useStore = create(
             if (firebaseUser) {
               localStorage.removeItem("token");
               const isNewUser = get().user?.uid !== firebaseUser.uid;
+              if (isNewUser) set(SESSION_DEFAULTS);
               set({
                 user: authService.toUser(firebaseUser),
                 ...(isNewUser && { plan: "free", usageCount: 0 }),
@@ -111,7 +117,7 @@ const useStore = create(
               });
               loadProfile(set, get);
             } else if (!localStorage.getItem("token")) {
-              set({ user: null, plan: "free", usageCount: 0, authLoading: false });
+              set({ ...SESSION_DEFAULTS, user: null, plan: "free", usageCount: 0, authLoading: false });
             }
           });
         }
@@ -202,10 +208,7 @@ const useStore = create(
         if (isFirebaseConfigured && auth.currentUser) {
           await authService.signOutFirebase();
         }
-        set({
-          user: null, plan: "free", usageCount: 0,
-          storyOutput: null, explorerOutput: null, combinedOutput: null, testResults: null
-        });
+        set({ ...SESSION_DEFAULTS, user: null, plan: "free", usageCount: 0 });
       },
 
       setPlan: (plan) => set({ plan }),

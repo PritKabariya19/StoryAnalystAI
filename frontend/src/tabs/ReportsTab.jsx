@@ -8,7 +8,21 @@ import Card from "../components/Card";
 import { TableRowSkeleton } from "../components/LoadingSkeleton";
 import jsPDF from "jspdf";
 
-const TYPE_LABELS = { story: "User Stories", explorer: "Website Explorer", combined: "Combined", test: "Test Execution" };
+const TYPE_LABELS = { story: "User Stories", explorer: "Website Explorer", "smart-tests": "Smart Tests", test: "Test Execution" };
+
+// Only test runs have a Pass / Fail / Error status. Other reports are lists.
+const isTestRun = (report) => report.type === "test";
+
+/** The report's individual items. Smart-test reports are saved grouped by component. */
+function reportRows(report) {
+  if (!Array.isArray(report.results)) return null;
+  if (report.type !== "smart-tests") return report.results;
+  return report.results.flatMap((suite) =>
+    (suite?.test_cases || []).map((tc) => ({ ...tc, component: suite.component })));
+}
+
+const rowTitle = (r) =>
+  r.condition || r.title || r.test_scenario || r.url || r.description || r.feature || "";
 
 export default function ReportsTab() {
   const [reports, setReports] = useState([]);
@@ -22,6 +36,7 @@ export default function ReportsTab() {
     try {
       const data = await listReports();
       setReports(Array.isArray(data?.reports) ? data.reports : []);
+      if (data?.warning) addToast(data.warning, "warning");
     } catch (err) {
       addToast("Failed to load reports: " + err.message, "error");
       setReports([]);
@@ -55,16 +70,17 @@ export default function ReportsTab() {
     doc.setFont("helvetica", "bold");
     // jsPDF's built-in fonts are Latin-1 only: strip characters they can't draw
     const pdfText = (v) => String(v ?? "").replace(/[\u2013\u2014]/g, "-").replace(/[^\x20-\x7E\xA0-\xFF]/g, "");
-    doc.text("StoryAnalyst AI - Test Report", 14, 20);
+    doc.text("StoryAnalyst AI - Report", 14, 20);
+    const rows = reportRows(report);
 
     doc.setFontSize(11);
     doc.setFont("helvetica", "normal");
     doc.setTextColor(100);
     doc.text(`Type: ${TYPE_LABELS[report.type] || report.type}`, 14, 32);
     doc.text(`Date: ${new Date(report.createdAt).toLocaleDateString()}`, 14, 40);
-    doc.text(`Total Results: ${Array.isArray(report.results) ? report.results.length : "-"}`, 14, 48);
+    doc.text(`Total Results: ${rows ? rows.length : "-"}`, 14, 48);
 
-    if (Array.isArray(report.results)) {
+    if (rows) {
       doc.setTextColor(0);
       doc.setFontSize(12);
       doc.setFont("helvetica", "bold");
@@ -72,18 +88,21 @@ export default function ReportsTab() {
       doc.setFontSize(10);
       doc.setFont("helvetica", "normal");
 
-      const s = report.results.reduce((acc, r) => {
-        acc[r.status === "Pass" ? "p" : r.status === "Fail" ? "f" : "e"]++; return acc;
-      }, { p: 0, f: 0, e: 0 });
-      doc.text(`Passed: ${s.p}   Failed: ${s.f}   Errors: ${s.e}`, 14, 56);
+      if (isTestRun(report)) {
+        const s = rows.reduce((acc, r) => {
+          acc[r.status === "Pass" ? "p" : r.status === "Fail" ? "f" : "e"]++; return acc;
+        }, { p: 0, f: 0, e: 0 });
+        doc.text(`Passed: ${s.p}   Failed: ${s.f}   Errors: ${s.e}`, 14, 56);
+      }
 
       let y = 72;
-      report.results.forEach((r, i) => {
-        const id     = r.tc_id || r.testId || r.id || `#${i + 1}`;
-        const title  = r.condition || r.title || r.feature || "";
-        const status = r.status || "-";
-        doc.setTextColor(status === "Pass" ? 0 : 200, status === "Pass" ? 150 : status === "Fail" ? 0 : 120, 0);
-        const lines = doc.splitTextToSize(pdfText(`${i + 1}. [${status}] ${id}  ${title}`), 180);
+      rows.forEach((r, i) => {
+        const id     = r.tc_id || r.testId || r.id || "";
+        const status = isTestRun(report) ? r.status || "-" : null;
+        if (status) doc.setTextColor(status === "Pass" ? 0 : 200, status === "Pass" ? 150 : status === "Fail" ? 0 : 120, 0);
+        else doc.setTextColor(0);
+        const label = [status && `[${status}]`, id, rowTitle(r)].filter(Boolean).join("  ");
+        const lines = doc.splitTextToSize(pdfText(`${i + 1}. ${label}`), 180);
         const err = r.error_message || r.error;
         const errLines = err && status !== "Pass" ? doc.splitTextToSize(pdfText(`   ${err}`), 175) : [];
         if (y + (lines.length + errLines.length) * 6 > 285) { doc.addPage(); y = 20; }
@@ -105,19 +124,20 @@ export default function ReportsTab() {
   }
 
   function exportCSV(report) {
-    if (!Array.isArray(report.results)) {
+    const items = reportRows(report);
+    if (!items) {
       addToast("No tabular data to export.", "warning");
       return;
     }
     // Union of keys across ALL rows (not just the first one)
-    const headers = [...new Set(report.results.flatMap((r) => Object.keys(r || {})))];
+    const headers = [...new Set(items.flatMap((r) => Object.keys(r || {})))];
     // RFC 4180 quoting: wrap in quotes, double any inner quotes; objects → JSON
     const cell = (v) => {
       if (v === null || v === undefined) return "";
       const str = typeof v === "object" ? JSON.stringify(v) : String(v);
       return /[",\r\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
     };
-    const rows = report.results.map((r) => headers.map((h) => cell(r?.[h])).join(","));
+    const rows = items.map((r) => headers.map((h) => cell(r?.[h])).join(","));
     // BOM so Excel opens UTF-8 (emoji/accents) correctly
     const csv = "\uFEFF" + [headers.map(cell).join(","), ...rows].join("\r\n");
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
@@ -221,7 +241,7 @@ export default function ReportsTab() {
                         {report.createdAt ? new Date(report.createdAt).toLocaleDateString() : "—"}
                       </td>
                       <td className="px-4 py-3 text-white/70">
-                        {Array.isArray(report.results) ? report.results.length : "—"}
+                        {reportRows(report)?.length ?? "—"}
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
@@ -249,9 +269,9 @@ export default function ReportsTab() {
               <div className="space-y-2 text-sm mb-4">
                 <div className="flex justify-between"><span className="text-white/40">Type</span><span className="text-white">{TYPE_LABELS[selected.type] || selected.type}</span></div>
                 <div className="flex justify-between"><span className="text-white/40">Date</span><span className="text-white">{selected.createdAt ? new Date(selected.createdAt).toLocaleString() : "—"}</span></div>
-                <div className="flex justify-between"><span className="text-white/40">Total Results</span><span className="text-white">{Array.isArray(selected.results) ? selected.results.length : "—"}</span></div>
+                <div className="flex justify-between"><span className="text-white/40">Total Results</span><span className="text-white">{reportRows(selected)?.length ?? "—"}</span></div>
                 {/* Pass / Fail breakdown */}
-                {Array.isArray(selected.results) && (() => {
+                {isTestRun(selected) && Array.isArray(selected.results) && (() => {
                   const p = selected.results.filter(r => r.status === "Pass").length;
                   const f = selected.results.filter(r => r.status === "Fail" || r.status === "Error").length;
                   const rate = selected.results.length > 0 ? Math.round(p / selected.results.length * 100) : 0;
@@ -265,20 +285,22 @@ export default function ReportsTab() {
                 })()}
               </div>
               <div className="flex flex-col gap-2 mb-4">
-                <Button variant="primary" size="sm" onClick={() => exportHTML(selected)} icon={Download}>Export HTML</Button>
+                {isTestRun(selected) && (
+                  <Button variant="primary" size="sm" onClick={() => exportHTML(selected)} icon={Download}>Export HTML</Button>
+                )}
                 <Button variant="secondary" size="sm" onClick={() => exportPDF(selected)} icon={Download}>Export PDF</Button>
                 <Button variant="secondary" size="sm" onClick={() => exportCSV(selected)} icon={FileText}>Export CSV</Button>
                 <Button variant="danger" size="sm" onClick={() => handleDelete(selected.id)} icon={Trash2}>Delete Report</Button>
               </div>
 
               {/* Per-result list */}
-              {Array.isArray(selected.results) && selected.results.length > 0 && (
+              {reportRows(selected)?.length > 0 && (
                 <div>
-                  <p className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-2">Test Results</p>
+                  <p className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-2">{isTestRun(selected) ? "Test Results" : "Items"}</p>
                   <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
-                    {selected.results.map((r, i) => {
+                    {reportRows(selected).map((r, i) => {
                       const tcId   = r.tc_id || r.testId || r.id || `#${i + 1}`;
-                      const title  = r.title || r.condition || r.description || tcId;
+                      const title  = rowTitle(r) || tcId;
                       const status = r.status || "—";
                       const time   = r.duration_seconds || r.execTime || null;
                       const statusColor =
@@ -288,7 +310,9 @@ export default function ReportsTab() {
                         "text-white/40 bg-white/5";
                       return (
                         <div key={i} className="flex items-start gap-2 text-xs p-2 rounded-lg bg-white/3 hover:bg-white/5 transition-colors">
-                          <span className={`mt-0.5 flex-shrink-0 px-1.5 py-0.5 rounded-full font-semibold ${statusColor}`}>{status}</span>
+                          {isTestRun(selected) && (
+                            <span className={`mt-0.5 flex-shrink-0 px-1.5 py-0.5 rounded-full font-semibold ${statusColor}`}>{status}</span>
+                          )}
                           <span className="flex-1 text-white/70 line-clamp-2" title={title}>{title}</span>
                           {time != null && <span className="text-white/30 flex-shrink-0">{Number(time).toFixed(1)}s</span>}
                         </div>

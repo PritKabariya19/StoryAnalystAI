@@ -9,8 +9,10 @@ Negative test validation rules:
 """
 
 import math
+import mimetypes
 import os
 import re
+import secrets
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +25,9 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError, sync_playwright,
 )
 
+from agents.text_match import has_word
+from agents.url_guard import BlockedURL, browser_options, check_url
+
 SCREENSHOTS_DIR   = Path(__file__).parent.parent / "screenshots"
 WAIT_TIMEOUT      = 5   # seconds per element wait
 PAGE_LOAD_TIMEOUT = 30  # seconds per page load (hard cap)
@@ -30,6 +35,7 @@ PAGE_SETTLE_MAX   = 6   # seconds max to wait for document ready + DOM quiet
 CLICK_SETTLE_MAX  = 3   # seconds max to wait after a click
 SHOT_SETTLE_MAX   = 1.5 # seconds max to wait before a screenshot
 MAX_WORKERS       = 8
+SCREENSHOT_TTL    = 7 * 24 * 60 * 60  # seconds a screenshot is kept
 # In headed mode, how long to wait for a human to solve a CAPTCHA (seconds).
 CAPTCHA_MANUAL_WAIT = int(os.environ.get("CAPTCHA_MANUAL_WAIT", "90"))
 
@@ -115,6 +121,29 @@ class ElementBlocked(PlaywrightError):
     """The element exists but could not be used."""
 
 
+class StepNotVerified(Exception):
+    """The step could not be performed or checked, so the test cannot Pass."""
+
+
+# Generator placeholders that mean "some error is shown": verified by
+# requiring visible error text.
+_GENERIC_ERROR_PAT = re.compile(
+    r"validation error|error message shown|appropriate error|error/validation message"
+    r"|^error for .+| is required$"
+)
+# Generator placeholders that describe behaviour the executor cannot check.
+_UNVERIFIABLE_PHRASES = (
+    "the page/response reflects", "system responds correctly",
+    "edge case safely", "boundary value", "handles the edge",
+    "operation completes", "accepts or rejects",
+    "action is rejected", "confirmation is shown",
+    "form is visible", "form submitted successfully",
+    "max length enforced or accepted", "input rejected or sanitized",
+    "script not executed, sanitized", "response within 3 seconds",
+    "tab order is logical", "page loaded", "navigation menu visible",
+)
+
+
 def _css_string(s: str) -> str:
     """Escape a string for use inside a quoted CSS attribute selector."""
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
@@ -146,11 +175,11 @@ _XP_LOWER = "translate({}, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuv
 # of whether the 'type' field was set by the generator.
 _NEGATIVE_KEYWORDS = (
     "without", "invalid", "missing", "wrong", "empty",
-    "no password", "incorrect", "bad ", "no ", "blank",
-    "fail", "error", "reject", "block", "deny", "exceed",
+    "incorrect", "bad", "no", "blank",
+    "fail", "error", "reject", "block", "deny", "denied", "exceed",
     "too long", "too short", "sql injection", "xss", "script",
-    "special char", "unauth", "unauthorized", "forbidden",
-    "expired", "duplicate", "already exist", "taken",
+    "special char", "special character", "unauthorized", "unauthorised",
+    "unauthenticated", "forbidden", "expired", "duplicate", "already exist", "taken",
 )
 
 
@@ -166,7 +195,7 @@ def _is_negative_tc(tc: dict) -> bool:
     """
     # 1. Explicit 'type' field (AI generator format)
     explicit_type = tc.get("type", "").lower()
-    if explicit_type in ("negative", "edge_case"):
+    if explicit_type in ("negative", "edge_case", "edge case"):
         return True
 
     # 2. 'test_type' field (rule-based / _tc2 format)
@@ -174,17 +203,41 @@ def _is_negative_tc(tc: dict) -> bool:
     if test_type_field in ("negative", "security", "boundary", "edge_case"):
         return True
 
-    # 3. Keyword heuristic — scan the human-readable fields
+    if explicit_type == "positive":
+        return False
+
+    # 3. Keyword heuristic — only for tests with no polarity of their own
     candidate_text = " ".join([
         tc.get("condition", ""),
         tc.get("test_scenario", ""),
         tc.get("title", ""),
         tc.get("feature", ""),
     ]).lower()
-    if any(kw in candidate_text for kw in _NEGATIVE_KEYWORDS):
+    if has_word(candidate_text, _NEGATIVE_KEYWORDS):
         return True
 
     return False
+
+
+def _purge_screenshots(directory: Path) -> None:
+    """Delete screenshots older than SCREENSHOT_TTL."""
+    cutoff = time.time() - SCREENSHOT_TTL
+    for path in directory.glob("*.png"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _labels(tc: dict) -> tuple:
+    """(feature, condition) for a result. Smart tests name these
+    component and test_scenario or title."""
+    return (
+        tc.get("feature") or tc.get("component") or "",
+        tc.get("condition") or tc.get("test_scenario") or tc.get("title") or "",
+    )
+
 
 # Regex: Enter 'value' in the 'fieldname' field
 # Enter/type <value> in/into [the] <field name> field|input|box
@@ -279,6 +332,16 @@ class TestExecutorAgent:
     def _alert_texts(self, value: List[str]) -> None:
         self._tls.alert_texts = value
 
+    @property
+    def _unverified(self) -> List[str]:
+        if not hasattr(self._tls, "unverified"):
+            self._tls.unverified = []
+        return self._tls.unverified
+
+    @_unverified.setter
+    def _unverified(self, value: List[str]) -> None:
+        self._tls.unverified = value
+
     @staticmethod
     def _resolve_headless(headless: bool) -> bool:
         """A visible browser needs a display. On a server without one
@@ -307,6 +370,7 @@ class TestExecutorAgent:
             screenshots_dir = SCREENSHOTS_DIR
         screenshots_dir = Path(screenshots_dir)
         screenshots_dir.mkdir(parents=True, exist_ok=True)
+        _purge_screenshots(screenshots_dir)
 
         if not test_cases:
             return []
@@ -332,11 +396,17 @@ class TestExecutorAgent:
                 all_indexed.extend(results)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(worker_task, chunk) for chunk in chunks]
+            futures = {pool.submit(worker_task, chunk): chunk for chunk in chunks}
             for f in as_completed(futures):
                 exc = f.exception()
                 if exc:
                     print(f"[executor] Worker error: {exc}")
+                    # Report the lost tests instead of dropping them
+                    message = f"Browser worker crashed: {str(exc)[:200]}"
+                    with lock:
+                        all_indexed.extend(
+                            (index, self._error_result(tc, message).to_dict())
+                            for index, tc in futures[f])
 
         all_indexed.sort(key=lambda x: x[0])
         return [r for _, r in all_indexed]
@@ -439,7 +509,7 @@ class TestExecutorAgent:
                     if browser is not None:
                         print("[executor] browser session died — restarting")
                     try:
-                        browser = pw.chromium.launch(headless=headless)
+                        browser = pw.chromium.launch(headless=headless, **browser_options())
                     except Exception as exc:
                         # Can't start the browser: mark this and all remaining
                         # TCs as Error instead of losing the worker's results.
@@ -457,6 +527,7 @@ class TestExecutorAgent:
                     )
                     page = self._new_page(context)
                     result = self._execute_one(tc, page, screenshots_dir, headless)
+                    self._downgrade_unverified(result)
                 except Exception as exc:
                     result = self._error_result(tc, f"Browser error: {str(exc)[:250]}")
                 finally:
@@ -468,11 +539,26 @@ class TestExecutorAgent:
                 results.append((original_idx, result.to_dict()))
         return results
 
+    def _downgrade_unverified(self, result: "ExecutionResult") -> None:
+        """With a step not performed or checked, neither Pass nor Fail can be
+        trusted: report Error."""
+        if result.status == "Error" or not self._unverified:
+            return
+        reason = "Not verified: " + "; ".join(self._unverified)
+        if result.error_message:
+            reason += f" | then failed: {result.error_message}"
+        result.status = "Error"
+        result.error_message = reason[:600]
+        result.final_verdict = f"NOT VERIFIED — {reason[:200]}"
+        result.message_match = None
+        result.log += f"\n⚠ {reason}"
+
     @staticmethod
     def _error_result(tc: dict, msg: str) -> "ExecutionResult":
+        feature, condition = _labels(tc)
         return ExecutionResult(
-            tc_id=tc.get("tc_id", "TC-???"), feature=tc.get("feature", ""),
-            user_role=tc.get("user_role", ""), condition=tc.get("condition", ""),
+            tc_id=tc.get("tc_id", "TC-???"), feature=feature,
+            user_role=tc.get("user_role", ""), condition=condition,
             page_url=tc.get("page_url", "") or "", status="Error",
             duration_seconds=0, error_message=msg, screenshot_path=None,
             log=f"💥 {msg}",
@@ -524,6 +610,10 @@ class TestExecutorAgent:
         """Load url and wait for it to settle. Returns True if the page load
         hit PAGE_LOAD_TIMEOUT (we then continue with the partial page).
         Network failures raise."""
+        try:
+            check_url(url)
+        except BlockedURL as exc:
+            raise StepNotVerified(str(exc))
         timed_out = False
         try:
             # Don't block on slow third-party scripts/ads; readiness is
@@ -614,9 +704,8 @@ class TestExecutorAgent:
         headless:        bool = True,
     ) -> ExecutionResult:
         tc_id     = tc.get("tc_id", "TC-???")
-        feature   = tc.get("feature", "")
+        feature, condition = _labels(tc)
         user_role = tc.get("user_role", "")
-        condition = tc.get("condition", "")
         page_url  = (tc.get("page_url") or "").strip()
         steps     = tc.get("automation_steps", [])
 
@@ -630,6 +719,8 @@ class TestExecutorAgent:
         log_lines: List[str] = []
         self._fill_log = []     # reset per-TC state
         self._alert_texts = []
+        self._unverified = []
+        executed = 0
         start = time.time()
 
         try:
@@ -712,13 +803,23 @@ class TestExecutorAgent:
                                 )
 
                             # ── Specific error message matching ──
-                            result = self._evaluate_negative_result(
-                                page, eff_expected, tc_id, feature,
-                                user_role, condition, page_url, start,
-                                screenshots_dir, log_lines, i,
-                                pre_submit_source=pre_submit_source,
-                            )
-                            return result
+                            locator_value = (step.get("locator") or {}).get("value")
+                            if eff_expected and not locator_value and step.get("type", "url") != "url":
+                                return self._evaluate_negative_result(
+                                    page, eff_expected, tc_id, feature,
+                                    user_role, condition, page_url, start,
+                                    screenshots_dir, log_lines, i,
+                                    pre_submit_source=pre_submit_source,
+                                )
+                            if locator_value and eff_expected:
+                                # The named element must show the expected error
+                                self._run_json_step({**step, "expected": eff_expected}, page)
+                                expected_error = ""  # verified here
+                            else:
+                                self._run_json_step(step, page)
+                            executed += 1
+                            log_lines.append(f"✔ Step {i}: [ASSERT] {locator_value or step_expected}")
+                            continue
 
                         # Capture page source before click (for silent reload detection)
                         if action == "click" and is_negative:
@@ -739,6 +840,7 @@ class TestExecutorAgent:
                             continue
                         kind = self._run_step(s, page)
                         log_lines.append(f"✔ Step {i}: {s[:90]}")
+                    executed += 1
 
                     # A click / navigation can land on a CAPTCHA (e.g. after submit)
                     if kind in ("click", "navigate"):
@@ -747,6 +849,9 @@ class TestExecutorAgent:
                             return self._captcha_result(
                                 page, tc_id, feature, user_role, condition,
                                 page_url, start, screenshots_dir, log_lines, blocked)
+                except StepNotVerified as exc:
+                    self._unverified.append(f"step {i}: {exc}")
+                    log_lines.append(f"⚠ Step {i} NOT VERIFIED: {exc}")
                 except (AssertionError, PlaywrightError) as exc:
 
                     # 1. Blocked Action (e.g. Disabled submit button)
@@ -783,7 +888,7 @@ class TestExecutorAgent:
                         )
 
                     # 2. For negative tests with other exceptions, check error message
-                    if is_negative and expected_error:
+                    if is_negative and expected_error and not isinstance(exc, AssertionError):
                         log_lines.append(f"⚠ Step {i} exception: {str(exc)[:80]} — checking error message...")
                         return self._evaluate_negative_result(
                             page, expected_error, tc_id, feature,
@@ -819,7 +924,10 @@ class TestExecutorAgent:
                     pre_submit_source=pre_submit_source,
                 )
 
-            log_lines.append("✅ All steps passed.")
+            if not executed and not self._unverified:
+                self._unverified.append("no steps were run")
+            if not self._unverified:
+                log_lines.append("✅ All steps passed.")
             pass_shot = self._screenshot(page, tc_id, screenshots_dir)
             return ExecutionResult(
                 tc_id=tc_id, feature=feature, user_role=user_role,
@@ -1040,7 +1148,8 @@ class TestExecutorAgent:
             js_msgs = page.evaluate("""() => {
                 var msgs = [];
                 document.querySelectorAll('input,select,textarea').forEach(function(el){
-                    if (!el.validity.valid && el.validationMessage) {
+                    // :user-invalid = the user edited the field or tried to submit
+                    if (el.matches(':user-invalid') && el.checkVisibility() && el.validationMessage) {
                         msgs.push(el.validationMessage);
                     }
                 });
@@ -1067,7 +1176,8 @@ class TestExecutorAgent:
                 idx = self._shot_counter
             safe_id = re.sub(r"[^\w\-]", "_", tc_id)
             ts    = int(time.time() * 1000)
-            fname = f"{idx:04d}_{safe_id}_{ts}.png"
+            # The random part keeps the image private: its URL needs no sign-in.
+            fname = f"{idx:04d}_{safe_id[:40]}_{ts}_{secrets.token_hex(16)}.png"
             abs_dir = Path(screenshots_dir).resolve()
             abs_dir.mkdir(parents=True, exist_ok=True)
             png = page.screenshot(timeout=15000)
@@ -1087,8 +1197,9 @@ class TestExecutorAgent:
 
         if action == "navigate":
             url = step.get("url")
-            if url:
-                self._navigate(page, url)
+            if not url:
+                raise StepNotVerified("navigate step has no URL")
+            self._navigate(page, url)
             return
 
         locator = step.get("locator", {})
@@ -1112,13 +1223,16 @@ class TestExecutorAgent:
         if action == "input":
             value = step.get("value", "")
             el = _get_element()
-            if el:
-                fill_result = self._smart_fill_element(page, el, lval or "field", value)
-                # Propagate hard failures (element not interactable) as exceptions
-                if fill_result["status"].startswith("error"):
-                    raise ElementBlocked(
-                        f"smart_fill failed on '{lval}': {fill_result['status']}"
-                    )
+            if not el:
+                raise StepNotVerified("input step has no locator")
+            fill_result = self._smart_fill_element(page, el, lval or "field", value)
+            # Propagate hard failures (element not interactable) as exceptions
+            if fill_result["status"].startswith("error"):
+                raise ElementBlocked(
+                    f"smart_fill failed on '{lval}': {fill_result['status']}"
+                )
+            if fill_result["status"].startswith("skipped"):
+                raise StepNotVerified(f"'{lval}' not filled: {fill_result['status']}")
             return
 
         if action == "click":
@@ -1133,14 +1247,44 @@ class TestExecutorAgent:
 
         if action == "assert":
             atype = step.get("type", "url")
-            expected = step.get("expected", "")
+            expected = (step.get("expected") or "").strip()
             if atype == "url":
+                if not expected:
+                    raise StepNotVerified("URL assertion has no expected value")
                 cur = page.url
                 assert expected in cur, f"URL mismatch: '{expected}' not in '{cur}'"
-            else:
+            elif lval:
+                try:
+                    el = _get_element()
+                except PlaywrightError:
+                    raise AssertionError(f"Element '{lval}' not found")
+                self._assert_element(page, el, lval, expected)
+            elif expected:
                 src = self._visible_text(page)
                 assert expected.lower() in src, f"Text '{expected}' not found on page"
+            else:
+                raise StepNotVerified("assertion has nothing to check")
             return
+
+        raise StepNotVerified(f"unsupported action '{action}'")
+
+    @staticmethod
+    def _assert_element(page: Page, el: Locator, name: str, expected: str) -> None:
+        """The element must be visible and, if given, contain the expected text."""
+        deadline = time.time() + WAIT_TIMEOUT
+        while True:
+            shown = _is_shown(el)
+            text = ""
+            if shown:
+                text = el.evaluate(
+                    "e => e.type === 'password' ? '' : (e.value || e.innerText || '')")
+                if expected.lower() in str(text).lower():
+                    return
+            if time.time() >= deadline:
+                break
+            page.wait_for_timeout(250)
+        assert shown, f"Element '{name}' is not visible"
+        assert False, f"Text '{expected}' not found in element '{name}'"
 
     def _run_step(self, step: str, page: Page) -> Optional[str]:
         """Run one natural-language step. Returns the kind of action that was
@@ -1160,12 +1304,16 @@ class TestExecutorAgent:
         # ── Clear field ─────────────────────────────────────────────────
         if re.search(r"\bclear\b.*\bfield\b", sl):
             fname = self._extract_quoted(s)
-            if fname:
-                el = self._find_input(page, fname)
-                try:
-                    el.fill("")
-                except PlaywrightError:
-                    el.evaluate("e => { e.value = ''; }")
+            if not fname:
+                raise StepNotVerified("no field name in clear step")
+            el = self._find_input(page, fname)
+            if el.evaluate("e => e.type") == "checkbox":
+                self._smart_fill_element(page, el, fname, "false")
+                return "input"
+            try:
+                el.fill("")
+            except PlaywrightError:
+                el.evaluate("e => { e.value = ''; }")
             return "input"
 
         # ── Enter value in field ────────────────────────────────────────
@@ -1184,6 +1332,8 @@ class TestExecutorAgent:
                 raise
             except Exception as e:
                 raise ElementNotFound(f"Could not fill field '{name}': {e}")
+            if fill_result["status"].startswith("skipped"):
+                raise StepNotVerified(f"'{name}' not filled: {fill_result['status']}")
             return "input"
 
         # ── Click ───────────────────────────────────────────────────────
@@ -1197,74 +1347,55 @@ class TestExecutorAgent:
         # ── Assert URL ──────────────────────────────────────────────────
         if re.search(r"\b(assert|verify|check|confirm)\b", sl) and "url" in sl:
             expected = self._extract_quoted(s) or self._extract_url(s)
-            if expected:
-                cur = page.url
-                assert expected in cur, f"URL mismatch: '{expected}' not in '{cur}'"
+            if not expected:
+                raise StepNotVerified("URL assertion has no expected value")
+            cur = page.url
+            assert expected in cur, f"URL mismatch: '{expected}' not in '{cur}'"
             return "assert"
 
         # ── Assert text on page ─────────────────────────────────────────
         if re.search(r"\b(assert|verify|check|confirm)\b", sl) and \
                 re.search(r"\b(page|response|text|message|show|display|reflect)\b", sl):
             expected = self._extract_quoted(s)
-            if expected:
-                exp_l = expected.lower()
-                # Generic placeholder phrases — skip
-                SKIP_PHRASES = [
-                    "the page/response reflects", "system responds correctly",
-                    "edge case safely", "boundary value", "handles the edge",
-                    "operation completes", "accepts or rejects",
-                    "error/validation message", "appropriate error",
-                    "action is rejected", "confirmation is shown",
-                ]
-                if any(p in exp_l for p in SKIP_PHRASES):
-                    return
-
-                src     = self._visible_text(page)
-                cur_url = page.url.lower()
-
-                # Smart positive vs negative check
-                positive_kw = ["success", "welcome", "logged in", "dashboard", "registered",
-                               "profile", "thank you", "confirmed", "submitted", "saved", "logout"]
-                negative_kw = ["invalid", "incorrect", "error", "failed", "wrong",
-                               "denied", "unauthorized", "not found", "required", "try again"]
-
-                if any(k in exp_l for k in positive_kw):
-                    if any(k in src for k in positive_kw) or \
-                            any(k in cur_url for k in ["dashboard", "home", "profile", "success", "account"]):
-                        return  # soft pass
-                    if "login" not in cur_url and "signin" not in cur_url:
-                        return  # redirected away from login = probably success
-                    assert False, "Expected success indicators but not found"
-
-                if any(k in exp_l for k in negative_kw):
-                    return  # soft pass for negative assertions
-
-                if len(exp_l) < 80 and exp_l not in src:
-                    assert False, f"Text '{expected}' not found on page"
-            return
+            if not expected:
+                raise StepNotVerified("assertion has no quoted expected text")
+            exp_l = expected.lower()
+            if exp_l in self._visible_text(page):
+                return "assert"
+            if _GENERIC_ERROR_PAT.search(exp_l):
+                for _ in range(7):  # allow up to 3s for async errors
+                    if self._find_visible_error_text(page):
+                        return "assert"
+                    page.wait_for_timeout(500)
+                assert False, f"Expected '{expected}', but no error message is shown"
+            if any(p in exp_l for p in _UNVERIFIABLE_PHRASES):
+                raise StepNotVerified(f"cannot check '{expected}' automatically")
+            assert False, f"Text '{expected}' not found on page"
 
         # ── Dropdown ────────────────────────────────────────────────────
         if "select" in sl and any(k in sl for k in ("option", "dropdown", "from")):
             opt = self._extract_quoted(s)
-            if opt:
-                selects = page.locator("select")
-                if selects.count():
-                    try:
-                        index = self._option_index(selects.first, opt, by_value=False)
-                        if index is not None:
-                            selects.first.select_option(index=index)
-                    except PlaywrightError:
-                        pass
-            return
+            selects = page.locator("select")
+            if opt and selects.count():
+                try:
+                    index = self._option_index(selects.first, opt, by_value=False)
+                    if index is not None:
+                        selects.first.select_option(index=index)
+                        return
+                except PlaywrightError:
+                    pass
+            raise StepNotVerified("dropdown option was not selected")
 
         # ── Checkbox ────────────────────────────────────────────────────
         if "checkbox" in sl or "check the" in sl:
             cbs = page.locator("input[type='checkbox']")
-            if cbs.count() and not cbs.first.is_checked():
+            if not cbs.count():
+                raise StepNotVerified("no checkbox on the page")
+            if not cbs.first.is_checked():
                 self._click(cbs.first)
             return
 
-        # Unknown step — silently skip
+        raise StepNotVerified(f"unrecognised step '{s[:60]}'")
 
     # ── Smart click (buttons + links + inputs) ─────────────────────────
 
@@ -1383,17 +1514,25 @@ class TestExecutorAgent:
                     if index is not None:
                         result["status"] = "filled - dropdown by value"
                     else:
-                        index = 0
-                        result["status"] = "filled - dropdown default (index 0)"
-                        result["warning"] = f"value '{value}' not found, used default"
-                element.select_option(index=index)
+                        result["status"] = f"skipped - dropdown has no option '{value}'"
+                if index is not None:
+                    element.select_option(index=index)
 
             # ── TYPE 3: Checkbox ──────────────────────────────────────
             elif tag == "input" and input_type == "checkbox":
-                should_check = str(value).lower() in ("true", "yes", "1", "on")
-                if element.is_checked() != should_check:
-                    self._click(element)
-                result["status"] = f"filled - checkbox set to {should_check}"
+                wanted = str(value).strip().lower()
+                should_check = wanted in ("true", "yes", "1", "on", "check", "checked")
+                if not should_check and wanted not in (
+                        "false", "no", "0", "off", "uncheck", "unchecked", ""):
+                    result["status"] = f"skipped - unclear checkbox value '{value}'"
+                else:
+                    if element.is_checked() != should_check:
+                        self._click(element)
+                    result["status"] = (
+                        f"filled - checkbox set to {should_check}"
+                        if element.is_checked() == should_check
+                        else f"error - checkbox could not be set to {should_check}"
+                    )
 
             # ── TYPE 4: Radio Button ──────────────────────────────────
             elif tag == "input" and input_type == "radio":
@@ -1416,7 +1555,14 @@ class TestExecutorAgent:
 
             # ── TYPE 6: File Upload ───────────────────────────────────
             elif tag == "input" and input_type == "file":
-                element.set_input_files(str(value))
+                # Never read a path from the server's disk: upload a
+                # placeholder file with the requested name.
+                name = str(value).replace("\\", "/").rsplit("/", 1)[-1]
+                element.set_input_files({
+                    "name": name,
+                    "mimeType": mimetypes.guess_type(name)[0] or "application/octet-stream",
+                    "buffer": b"StoryAnalystAI test file\n",
+                } if name else [])
                 result["status"] = "filled - file upload"
 
             # ── TYPE 7: Date / Time ───────────────────────────────────

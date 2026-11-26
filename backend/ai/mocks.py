@@ -52,6 +52,31 @@ def user_stories(requirement):
     ]
 
 
+def story_analysis(requirement):
+    """Same shape as the AI service's /analyze response."""
+    cases = [
+        ("TC-001", "Positive", "High", "Valid input is accepted", "Enter valid details and submit.", "The request succeeds."),
+        ("TC-002", "Negative", "High", "Invalid input is rejected", "Enter invalid details and submit.", "An error message is shown."),
+    ]
+    return {
+        "analysis": {
+            "feature": requirement[:40],
+            "user_role": "user",
+            "conditions": [f"{title} → {expected}" for _, _, _, title, _, expected in cases],
+        },
+        "test_suite": {
+            "feature": requirement[:40],
+            "user_role": "user",
+            "total_test_cases": len(cases),
+            "test_cases": [
+                {"id": tc_id, "title": title, "type": kind, "priority": priority,
+                 "preconditions": [], "steps": [step], "expected_result": expected}
+                for tc_id, kind, priority, title, step, expected in cases
+            ],
+        },
+    }
+
+
 def _field(name, kind, placeholder):
     return {
         "name": name, "type": kind, "id": name, "selector": f"#{name}", "required": True,

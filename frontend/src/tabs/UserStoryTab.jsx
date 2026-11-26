@@ -7,58 +7,71 @@ import Button from "../components/Button";
 import Card from "../components/Card";
 import { CardSkeleton } from "../components/LoadingSkeleton";
 
-function StoryCard({ story, index }) {
-  const priorityColors = { High: "text-red-400 bg-red-500/10", Medium: "text-amber-400 bg-amber-500/10", Low: "text-emerald-400 bg-emerald-500/10" };
+const priorityColors = { High: "text-red-400 bg-red-500/10", Medium: "text-amber-400 bg-amber-500/10", Low: "text-emerald-400 bg-emerald-500/10" };
 
+function AnalysisCard({ analysis }) {
+  return (
+    <Card className="space-y-3">
+      <div>
+        <h3 className="font-semibold text-white">{analysis.feature}</h3>
+        <p className="text-sm text-white/60"><span className="text-white/40">User role:</span> {analysis.user_role}</p>
+      </div>
+
+      {analysis.conditions?.length > 0 && (
+        <div>
+          <p className="text-xs font-semibold text-white/40 mb-2">Conditions</p>
+          <ul className="space-y-1.5">
+            {analysis.conditions.map((c, i) => (
+              <li key={i} className="flex items-start gap-2 text-xs text-white/60">
+                <CheckCircle size={12} className="text-emerald-400 mt-0.5 flex-shrink-0" />
+                {c}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function TestCaseCard({ testCase, index }) {
   return (
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: index * 0.08 }}
+      transition={{ delay: Math.min(index, 8) * 0.08 }}
     >
       <Card className="space-y-3">
-        <div className="flex items-start justify-between gap-2">
-          <div>
-            <div className="flex items-center gap-2 mb-1">
-              <span className="text-xs font-mono text-white/30">{story.id}</span>
-              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${priorityColors[story.priority] || priorityColors.Medium}`}>
-                {story.priority}
-              </span>
-              <span className="text-xs text-white/30">{story.storyPoints} pts</span>
-            </div>
-            <h3 className="font-semibold text-white">{story.title}</h3>
+        <div>
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-xs font-mono text-white/30">{testCase.id}</span>
+            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${priorityColors[testCase.priority] || priorityColors.Medium}`}>
+              {testCase.priority}
+            </span>
+            <span className="text-xs text-white/30">{testCase.type}</span>
           </div>
+          <h3 className="font-semibold text-white">{testCase.title}</h3>
         </div>
 
-        <div className="space-y-2 text-sm">
-          <p className="text-white/60"><span className="text-white/40">As a</span> {story.asA}</p>
-          <p className="text-white/60"><span className="text-white/40">I want</span> {story.iWant}</p>
-          <p className="text-white/60"><span className="text-white/40">So that</span> {story.soThat}</p>
-        </div>
-
-        {story.acceptanceCriteria?.length > 0 && (
+        {testCase.preconditions?.length > 0 && (
           <div>
-            <p className="text-xs font-semibold text-white/40 mb-2">Acceptance Criteria</p>
-            <ul className="space-y-1.5">
-              {story.acceptanceCriteria.map((c, i) => (
-                <li key={i} className="flex items-start gap-2 text-xs text-white/60">
-                  <CheckCircle size={12} className="text-emerald-400 mt-0.5 flex-shrink-0" />
-                  {c}
-                </li>
-              ))}
+            <p className="text-xs font-semibold text-white/40 mb-2">Preconditions</p>
+            <ul className="list-disc pl-4 space-y-1 text-xs text-white/60">
+              {testCase.preconditions.map((p, i) => <li key={i}>{p}</li>)}
             </ul>
           </div>
         )}
 
-        {story.tags?.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {story.tags.map((tag) => (
-              <span key={tag} className="text-xs px-2 py-0.5 rounded-full bg-brand-purple/20 text-purple-300">
-                #{tag}
-              </span>
-            ))}
+        {testCase.steps?.length > 0 && (
+          <div>
+            <p className="text-xs font-semibold text-white/40 mb-2">Steps</p>
+            <ol className="list-decimal pl-4 space-y-1 text-xs text-white/60">
+              {testCase.steps.map((step, i) => <li key={i}>{step}</li>)}
+            </ol>
           </div>
         )}
+
+        <p className="text-sm text-white/60"><span className="text-white/40">Expected:</span> {testCase.expected_result}</p>
       </Card>
     </motion.div>
   );
@@ -81,11 +94,13 @@ export default function UserStoryTab() {
     setLoading(true); setError(null); setOutput(null);
     try {
       const data = await generateStory(requirement);
-      const stories = data.analysis || data.stories || data;
-      setOutput({ stories: Array.isArray(stories) ? stories : [stories], mock: data.mock, usageCount: data.usageCount });
-      if (data.usageCount) setUsageCount(data.usageCount);
+      const testCases = data.test_suite?.test_cases;
+      if (!data.analysis || !testCases) throw new Error("Unexpected response from the AI service.");
+      setOutput({ analysis: data.analysis, testCases, mock: data.mock, usageCount: data.usageCount });
+      if (data.usageCount != null) setUsageCount(data.usageCount);
       if (data.mock) addToast("Showing demo data — Python AI service unavailable.", "warning");
-      else addToast("User stories generated!", "success");
+      else if (data.ai_generated === false) addToast("Gemini was unavailable — these are rule-based results.", "warning");
+      else addToast("Test cases generated!", "success");
     } catch (err) {
       setError(err.message);
       if (err.message?.includes("limit")) addToast(err.message, "error");
@@ -96,7 +111,7 @@ export default function UserStoryTab() {
 
   async function handleCopy() {
     if (!output) return;
-    await navigator.clipboard.writeText(JSON.stringify(output.stories, null, 2));
+    await navigator.clipboard.writeText(JSON.stringify({ analysis: output.analysis, test_cases: output.testCases }, null, 2));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
     addToast("Copied to clipboard!", "success");
@@ -104,19 +119,19 @@ export default function UserStoryTab() {
 
   function handleDownload() {
     if (!output) return;
-    const blob = new Blob([JSON.stringify(output.stories, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify({ analysis: output.analysis, test_cases: output.testCases }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "user_stories.json"; a.click();
+    const a = document.createElement("a"); a.href = url; a.download = "story_analysis.json"; a.click();
     URL.revokeObjectURL(url);
-    addToast("Downloaded user_stories.json", "success");
+    addToast("Downloaded story_analysis.json", "success");
   }
 
   async function handleSave() {
     if (!output) return;
     setSaving(true);
     try {
-      await saveReport("story", output.stories, { total: output.stories.length }, { requirement });
-      addToast("Report saved!", "success");
+      const saved = await saveReport("story", output.testCases, { total: output.testCases.length }, { requirement, analysis: output.analysis });
+      addToast(saved.warning || "Report saved!", saved.warning ? "warning" : "success");
     } catch (err) {
       addToast("Failed to save: " + err.message, "error");
     } finally {
@@ -151,7 +166,7 @@ export default function UserStoryTab() {
 
           <div className="flex items-center justify-between mt-2 text-xs text-white/30">
             <span>{requirement.length} chars</span>
-            <span>Generates 3-8 user stories</span>
+            <span>Generates conditions and test cases</span>
           </div>
 
           <Button
@@ -161,7 +176,7 @@ export default function UserStoryTab() {
             className="w-full mt-4"
             icon={Brain}
           >
-            Generate User Stories
+            Analyze Story
           </Button>
         </Card>
 
@@ -201,7 +216,7 @@ export default function UserStoryTab() {
             {/* Action bar */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className="text-sm font-semibold text-white">{output.stories.length} stories generated</span>
+                <span className="text-sm font-semibold text-white">{output.testCases.length} test cases generated</span>
                 {output.mock && <span className="badge badge-free">Demo Data</span>}
               </div>
               <div className="flex items-center gap-2">
@@ -214,8 +229,9 @@ export default function UserStoryTab() {
             </div>
 
             <div className="space-y-4">
-              {output.stories.map((story, i) => (
-                <StoryCard key={story.id || i} story={story} index={i} />
+              <AnalysisCard analysis={output.analysis} />
+              {output.testCases.map((testCase, i) => (
+                <TestCaseCard key={testCase.id || i} testCase={testCase} index={i} />
               ))}
             </div>
           </>
@@ -224,7 +240,7 @@ export default function UserStoryTab() {
         {!output && !loading && !error && (
           <div className="glass rounded-2xl p-12 text-center">
             <Brain size={40} className="mx-auto text-white/20 mb-3" />
-            <p className="text-white/40 text-sm">Your generated user stories will appear here</p>
+            <p className="text-white/40 text-sm">Your story analysis and test cases will appear here</p>
           </div>
         )}
       </div>

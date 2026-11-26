@@ -2,6 +2,7 @@
 import logging
 
 from accounts import store
+from ai import usage
 from core import firebase
 from core.http import iso_now
 
@@ -37,6 +38,7 @@ def get_or_create(claims):
         if missing:
             ref.set(missing, merge=True)
         profile = {**stored, **missing}
+        profile["usageCount"] = usage.count_this_month(profile)
         return {"uid": uid, **{k: profile[k] for k in FIELDS}}
     except Exception:
         log.exception("[Auth Profile Error]")

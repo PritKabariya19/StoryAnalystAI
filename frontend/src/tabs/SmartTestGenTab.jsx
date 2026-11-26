@@ -60,7 +60,7 @@ function StoryBreakdown({ breakdown }) {
 }
 
 /* ── Component Suite Card ──────────────────────── */
-function ComponentSuite({ suite, index, addToast }) {
+function ComponentSuite({ suite, index }) {
   const [expanded, setExpanded] = useState(true);
   const cases = suite.test_cases || [];
 
@@ -103,7 +103,7 @@ function ComponentSuite({ suite, index, addToast }) {
                   const priKey = tc.priority || "Medium";
                   const priColor = PRIORITY_COLORS[priKey] || PRIORITY_COLORS.Medium;
                   const steps = tc.test_steps || tc.manual_steps || [];
-                  const scenario = tc.test_scenario || tc.condition || "";
+                  const scenario = tc.test_scenario || tc.condition || tc.title || "";
                   const expected = tc.expected_result || "";
 
                   return (
@@ -157,8 +157,9 @@ export default function SmartTestGenTab() {
     try {
       const data = await generateSmartTests(url, query, userStory, depth);
       setOutput(data);
-      if (data.usageCount) setUsageCount(data.usageCount);
+      if (data.usageCount != null) setUsageCount(data.usageCount);
       if (data.mock) addToast("Showing demo data — AI service unavailable.", "warning");
+      else if (data.ai_generated === false) addToast("Gemini was unavailable — these are rule-based tests.", "warning");
       else addToast(`Generated ${data.summary?.total || 0} test cases!`, "success");
     } catch (err) {
       setError(err.message);
@@ -170,8 +171,9 @@ export default function SmartTestGenTab() {
   async function handleSave() {
     if (!output) return;
     try {
-      await saveReport("smart-tests", output.test_suites || [], output, { url, query });
-      addToast("Test suites saved!", "success");
+      const { test_suites: suites = [], ...summary } = output;
+      const saved = await saveReport("smart-tests", suites, summary, { url, query });
+      addToast(saved.warning || "Test suites saved!", saved.warning ? "warning" : "success");
     } catch (err) { addToast("Failed to save: " + err.message, "error"); }
   }
 
@@ -317,7 +319,7 @@ export default function SmartTestGenTab() {
 
           {/* Component Test Suites */}
           {output.test_suites?.map((suite, i) => (
-            <ComponentSuite key={suite.component + i} suite={suite} index={i} addToast={addToast} />
+            <ComponentSuite key={suite.component + i} suite={suite} index={i} />
           ))}
         </>
       )}

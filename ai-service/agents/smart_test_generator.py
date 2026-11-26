@@ -13,21 +13,21 @@ Output format is compatible with the existing TestExecutorAgent.
 """
 
 import json
+import logging
 import re
 import time
 from typing import List, Dict
 
-import google.generativeai as genai
-
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from agents import llm
+from agents.url_guard import check_url, request_proxies
 from agents.website_extractor import WebsiteExtractorAgent
-from agents.combined_generator import CombinedGeneratorAgent
+from agents.combined_generator import CombinedGeneratorAgent, enter_step, first_option
 
-genai.configure(api_key=GEMINI_API_KEY)
+log = logging.getLogger(__name__)
 
 
 # 8 testing types for Senior QA methodology
-TEST_TYPES = ["UI", "Functional", "Validation", "Boundary", "Negative", "Security", "Performance", "Usability"]
+TEST_TYPES = ["UI", "Functional", "Validation", "Boundary", "Negative", "Security"]
 
 _TEST_GEN_SYSTEM_PROMPT = """You are an expert QA Performance Engineer optimizing for extreme speed and efficiency (Antigravity Mode).
 
@@ -37,7 +37,22 @@ STEPS:
 1. Break the user story into Actor / Action / Goal.
 2. Identify website components from crawl data.
 3. Map components to the user story.
-4. Generate test cases GROUPED BY COMPONENT covering ALL 8 testing types: UI, Functional, Validation, Boundary, Negative, Security, Performance, Usability.
+4. Generate test cases GROUPED BY COMPONENT covering these testing types: UI, Functional, Validation, Boundary, Negative, Security.
+
+WHAT THE EXECUTOR CAN DO — a test that needs anything else cannot be run, so do not write it:
+- The only actions are "navigate", "input", "click" and "assert". There is no hover, key press, focus check, wait or timing.
+- "assert" with "type": "url" checks that the URL contains "expected".
+- "assert" with "type": "element" and a "locator" checks that the element is VISIBLE and, if "expected" is not "", that its visible text or field value contains "expected".
+- "assert" with "type": "text" and no locator checks that "expected" is visible text on the page. "expected" must be text the page really shows, never a description of behaviour.
+- It cannot check that something is hidden, absent, disabled or has disappeared. Assert only what should be visible.
+- It cannot check performance, tab order, focus, colours, layout, whether a password is masked, or anything stored on a server.
+
+NEVER INVENT ELEMENTS OR MESSAGES:
+- Use only elements listed in the crawl data ("forms" and "elements_outside_forms"). Never make up classes or selectors such as ".error-message" or ":invalid + .error".
+- An element with "hidden": true cannot be used until it is shown. If a form is hidden, first click the button or link that shows it, usually one listed in "elements_outside_forms".
+- Scripts usually write result messages into an element that is empty at first. "script_messages" lists the texts the page's scripts can show. Assert that element with the exact message this test should produce, so that a success message cannot pass a failure test, or the reverse. Only if no listed message fits, assert the element is visible with "expected": "".
+- Every test starts on a fresh page with empty storage. No account or other record exists unless the same test creates it first.
+- When the browser itself blocks a submit (a required field is empty, or type="email" is malformed) the page shows no element of its own. Assert "type": "text" with "expected": "Please fill out this field" for an empty required field, or "Please include an" for an email without "@".
 
 RULES YOU MUST FOLLOW:
 1. CLASSIFY every test case as one of:
@@ -60,7 +75,8 @@ RULES YOU MUST FOLLOW:
 - Minimal Steps: navigate → input → click → assert. No extra steps.
 - Deterministic Execution: Every step must be fully defined and machine-executable.
 - Fastest Locator Strategy: 1. id (fastest), 2. name, 3. css, 4. xpath (only if needed).
-- Assertion Efficiency: For negative tests, the assert expected value MUST be the error message text.
+- Locator Accuracy: use type "id" only with an "id" value from the crawl data, and type "name" only with a "name" value. If an element has neither, use css built from what the crawl data shows (e.g. #formId button[type='submit']).
+- Assertion Efficiency: every test ends with one assert that follows the rules above.
 
 RETURN ONLY valid JSON with this exact structure:
 {
@@ -73,7 +89,7 @@ RETURN ONLY valid JSON with this exact structure:
           "tc_id": "TC_01",
           "title": "<test case title>",
           "type": "positive | negative | edge_case",
-          "test_type": "<UI|Functional|Validation|Boundary|Negative|Security|Performance|Usability>",
+          "test_type": "<UI|Functional|Validation|Boundary|Negative|Security>",
           "preconditions": "<any setup needed>",
           "test_steps": ["Step 1", "Step 2"],
           "input_data": "<what the user enters>",
@@ -87,7 +103,7 @@ RETURN ONLY valid JSON with this exact structure:
             {"action": "navigate", "url": "https://example.com/login"},
             {"action": "input", "locator": {"type": "id|name|css|xpath", "value": "username"}, "value": "user@test.com"},
             {"action": "click", "locator": {"type": "css", "value": "button[type='submit']"}},
-            {"action": "assert", "type": "url|element", "expected": "/dashboard OR error message"}
+            {"action": "assert", "type": "url|element|text", "locator": {"type": "id", "value": "<only for type element>"}, "expected": "<see the rules above>"}
           ],
           "mapped": true
         }
@@ -136,12 +152,19 @@ class SmartTestGeneratorAgent:
                     test_suites = self._group_flat_cases(ai_result)
                 if test_suites:
                     ai_generated = True
+            if not test_suites:
+                log.warning("Gemini returned no usable test cases; using rule-based tests.")
         except Exception:
-            pass
+            log.exception("Gemini generation failed; using rule-based tests.")
 
         # ── Step 4: Fallback to rule-based ──────────────────────────────
         if not test_suites:
             test_suites = self._rule_based_fallback(extraction, query, url)
+
+        # The executor gets a flat list, so each case needs its suite's component
+        for suite in test_suites:
+            for tc in suite.get("test_cases", []):
+                tc["component"] = tc.get("component") or suite["component"]
 
         # ── Step 5: Build summary ───────────────────────────────────────
         all_cases = [tc for suite in test_suites for tc in suite.get("test_cases", [])]
@@ -212,17 +235,11 @@ class SmartTestGeneratorAgent:
             "Generate component-grouped test suites. Return ONLY valid JSON."
         )
 
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            system_instruction=_TEST_GEN_SYSTEM_PROMPT,
-        )
-
         # Retry logic
         wait = 3
         for attempt in range(2):
             try:
-                response = model.generate_content(user_prompt)
-                raw = response.text.strip()
+                raw = llm.generate(user_prompt, _TEST_GEN_SYSTEM_PROMPT, as_json=True)
                 return self._parse_test_cases(raw)
             except Exception as exc:
                 err = str(exc)
@@ -233,6 +250,68 @@ class SmartTestGeneratorAgent:
                 raise
 
         return []
+
+    @staticmethod
+    def _locator_attrs(tag) -> dict:
+        """The element's real id / name attributes. Never substitute one for
+        the other: the AI builds its locators from these keys."""
+        return {key: tag.get(key) for key in ("id", "name") if tag.get(key)}
+
+    @staticmethod
+    def _type_info(tag) -> dict:
+        """Field type; for a dropdown, also the options it offers."""
+        if tag.name != "select":
+            return {"type": tag.get("type", "text")}
+        options = [
+            {"value": o.get("value", o.get_text(strip=True)), "text": o.get_text(strip=True)}
+            for o in tag.find_all("option") if not o.has_attr("disabled")
+        ]
+        return {"type": "select", "options": options[:20]}
+
+    @staticmethod
+    def _is_hidden(tag) -> bool:
+        """Hidden in the HTML itself (attribute, utility class or inline style),
+        on the tag or an ancestor. CSS and scripts are not evaluated."""
+        for node in [tag, *tag.parents]:
+            if not getattr(node, "attrs", None):
+                continue
+            style = str(node.get("style", "")).replace(" ", "").lower()
+            if (node.has_attr("hidden") or "display:none" in style
+                    or {"hidden", "d-none"} & set(node.get("class") or [])):
+                return True
+        return False
+
+    @staticmethod
+    def _script_messages(soup) -> list:
+        """Texts that inline scripts write into the page or show in alerts, so
+        assertions can name the exact message."""
+        pattern = re.compile(
+            r"""(?:(?:innerText|textContent)\s*=|\balert\()\s*(["'`])((?:(?!\1)[^\n$]){4,120})\1""")
+        found = []
+        for script in soup.find_all("script", src=False):
+            found += [m.group(2) for m in pattern.finditer(script.get_text())]
+        return list(dict.fromkeys(found))[:25]
+
+    def _outside_elements(self, soup) -> list:
+        """Buttons and id'd elements that are not part of a form: toggles that
+        open forms, and the places where scripts write messages."""
+        found = []
+        for tag in soup.find_all(True):
+            if tag.name in ("form", "script", "style", "meta", "link", "html", "head", "body"):
+                continue
+            if not (tag.get("id") or tag.name == "button"):
+                continue
+            if tag.find_parent("form") or tag.find(["form", "input", "button"]):
+                continue
+            found.append({
+                **self._locator_attrs(tag),
+                "tag": tag.name,
+                "text": tag.get_text(strip=True)[:60],
+                **({"hidden": True} if self._is_hidden(tag) else {}),
+            })
+            if len(found) >= 30:
+                break
+        return found
 
     def _build_crawl_context(self, extraction: dict) -> str:
         """Build a compact JSON context from crawl data for the AI prompt."""
@@ -266,38 +345,43 @@ class SmartTestGeneratorAgent:
             try:
                 import requests
                 from bs4 import BeautifulSoup
+                check_url(page.get("url", ""))
                 resp = requests.get(
                     page.get("url", ""),
                     headers=self._extractor.HEADERS,
                     timeout=8, verify=False,
+                    proxies=request_proxies(),
                 )
                 soup = BeautifulSoup(resp.text, "html.parser")
                 for form_tag in soup.find_all("form"):
                     form_data = {
-                        "name": form_tag.get("id") or form_tag.get("name") or form_tag.get("action", "form"),
+                        **self._locator_attrs(form_tag),
                         "action": form_tag.get("action", ""),
                         "method": form_tag.get("method", "GET"),
+                        **({"hidden": True} if self._is_hidden(form_tag) else {}),
                         "fields": [],
                         "buttons": [],
                     }
                     for inp in form_tag.find_all(["input", "select", "textarea"]):
-                        inp_type = inp.get("type", "text")
-                        if inp_type in ("hidden", "submit"):
+                        type_info = self._type_info(inp)
+                        if type_info["type"] in ("hidden", "submit"):
                             continue
                         form_data["fields"].append({
-                            "name": inp.get("name") or inp.get("id") or inp.get("placeholder", "field"),
-                            "type": inp_type,
+                            **self._locator_attrs(inp),
+                            **type_info,
                             "placeholder": inp.get("placeholder", ""),
                             "required": inp.has_attr("required"),
                         })
                     for btn in form_tag.find_all(["button", "input"]):
                         if btn.name == "input" and btn.get("type") == "submit":
                             form_data["buttons"].append({
+                                **self._locator_attrs(btn),
                                 "text": btn.get("value", "Submit"),
                                 "type": "submit",
                             })
                         elif btn.name == "button":
                             form_data["buttons"].append({
+                                **self._locator_attrs(btn),
                                 "text": btn.get_text(strip=True) or "Submit",
                                 "type": btn.get("type", "submit"),
                             })
@@ -311,6 +395,8 @@ class SmartTestGeneratorAgent:
                     if text and len(text) < 50:
                         links_on_page.append(text)
                 page_info["clickable_links"] = links_on_page[:15]
+                page_info["elements_outside_forms"] = self._outside_elements(soup)
+                page_info["script_messages"] = self._script_messages(soup)
 
             except Exception:
                 pass
@@ -321,9 +407,9 @@ class SmartTestGeneratorAgent:
             context["pages"].append(page_info)
 
         raw = json.dumps(context, ensure_ascii=False, default=str)
-        # Cap to ~6000 chars to stay within token limits
-        if len(raw) > 6000:
-            raw = raw[:6000] + "...(truncated)"
+        # Cap the size to stay within token limits
+        if len(raw) > 12000:
+            raw = raw[:12000] + "...(truncated)"
         return raw
 
     def _parse_test_cases(self, raw: str):
@@ -372,7 +458,7 @@ class SmartTestGeneratorAgent:
         "email": "testuser@example.com", "password": "ValidPass@123",
         "tel": "9876543210", "number": "42", "text": "Test Value",
         "url": "https://example.com", "date": "2026-01-15",
-        "checkbox": "check the checkbox", "select": "select a valid option",
+        "checkbox": "true",
     }
     _INVALID_VALUES = {
         "email": "not-an-email", "password": "123", "tel": "abc",
@@ -384,8 +470,10 @@ class SmartTestGeneratorAgent:
         import requests
         from bs4 import BeautifulSoup
         try:
+            check_url(page_url)
             resp = requests.get(page_url, headers=self._extractor.HEADERS,
-                                timeout=8, verify=False)
+                                timeout=8, verify=False,
+                                proxies=request_proxies())
             soup = BeautifulSoup(resp.text, "html.parser")
         except Exception:
             return {"forms": [], "links": [], "title": "Page"}
@@ -398,17 +486,18 @@ class SmartTestGeneratorAgent:
         forms = []
         for form_tag in soup.find_all("form"):
             form = {
-                "name": form_tag.get("id") or form_tag.get("name") or form_tag.get("class", ["form"])[0] if form_tag.get("class") else "form",
+                "name": (form_tag.get("id") or form_tag.get("name")
+                         or (form_tag.get("class") or ["form"])[0]),
                 "action": form_tag.get("action", ""),
                 "fields": [], "buttons": [],
             }
             for inp in form_tag.find_all(["input", "select", "textarea"]):
-                itype = inp.get("type", "text")
-                if itype in ("hidden",):
+                type_info = self._type_info(inp)
+                if type_info["type"] in ("hidden",):
                     continue
                 name = inp.get("name") or inp.get("id") or inp.get("placeholder", "field")
                 form["fields"].append({
-                    "name": name, "type": itype,
+                    "name": name, **type_info,
                     "placeholder": inp.get("placeholder", ""),
                     "required": inp.has_attr("required"),
                     "selector": f"#{inp.get('id')}" if inp.get("id") else f"[name='{inp.get('name', '')}']",
@@ -431,7 +520,10 @@ class SmartTestGeneratorAgent:
 
         return {"forms": forms, "links": links, "title": title}
 
-    def _pick_valid(self, fname: str, ftype: str) -> str:
+    def _pick_valid(self, fname: str, ftype: str, options: list = None) -> str:
+        # Type first: a checkbox named "email_updates" must not get an email
+        if ftype == "checkbox": return self._VALID_VALUES["checkbox"]
+        if ftype == "select": return first_option(options)
         fl = fname.lower()
         if "email" in fl or ftype == "email": return self._VALID_VALUES["email"]
         if "pass" in fl or ftype == "password": return self._VALID_VALUES["password"]
@@ -449,7 +541,8 @@ class SmartTestGeneratorAgent:
         return self._INVALID_VALUES.get(ftype, "invalid_value")
 
     def _rule_based_fallback(self, extraction: dict, query: str, url: str) -> list:
-        """Component-grouped test suites covering 8 testing types."""
+        """Component-grouped test suites covering the testing types the executor
+        can check. Performance and usability are not among them."""
         pages = extraction.get("pages", [])
         suites = {}  # component_name -> list of test cases
         tc_idx = 1
@@ -487,9 +580,9 @@ class SmartTestGeneratorAgent:
                 steps = [f"Navigate to {page_url}"]
                 auto = [f"Open browser and navigate to '{page_url}'."]
                 for fld in fields:
-                    v = self._pick_valid(fld["name"], fld["type"])
+                    v = self._pick_valid(fld["name"], fld["type"], fld.get("options"))
                     steps.append(f"Enter '{v}' in '{fld['name']}'")
-                    auto.append(f"Enter '{v}' in the '{fld['name']}' field.")
+                    auto.append(enter_step(v, fld["name"]))
                 steps.append(f"Click '{btn_text}'")
                 auto += [f"Find button with text '{btn_text}' and click().",
                          "Assert that the page/response reflects: 'form submitted successfully'."]
@@ -516,9 +609,10 @@ class SmartTestGeneratorAgent:
                     auto3 = [f"Open browser and navigate to '{page_url}'."]
                     for f2 in fields:
                         if f2["name"] == fld["name"]:
-                            auto3.append(f"Enter '{inv}' in the '{f2['name']}' field.")
+                            auto3.append(enter_step(inv, f2["name"]))
                         else:
-                            auto3.append(f"Enter '{self._pick_valid(f2['name'], f2['type'])}' in the '{f2['name']}' field.")
+                            auto3.append(enter_step(
+                                self._pick_valid(f2["name"], f2["type"], f2.get("options")), f2["name"]))
                     auto3 += [f"Find button with text '{btn_text}' and click().",
                               f"Assert that the page/response reflects: 'error for {fld['name']}'."]
                     cases.append(self._tc2(tc_idx, comp_name, "Validation",
@@ -536,7 +630,8 @@ class SmartTestGeneratorAgent:
                         if f2["name"] == fld["name"]:
                             auto4.append(f"Clear the '{f2['name']}' field.")
                         else:
-                            auto4.append(f"Enter '{self._pick_valid(f2['name'], f2['type'])}' in the '{f2['name']}' field.")
+                            auto4.append(enter_step(
+                                self._pick_valid(f2["name"], f2["type"], f2.get("options")), f2["name"]))
                     auto4 += [f"Find button with text '{btn_text}' and click().",
                               f"Assert that the page/response reflects: '{fld['name']} is required'."]
                     cases.append(self._tc2(tc_idx, comp_name, "Negative",
@@ -564,7 +659,7 @@ class SmartTestGeneratorAgent:
                         [f"Navigate to {page_url}", f"Enter \"' OR '1'='1\" in '{target['name']}'", f"Click '{btn_text}'"],
                         "Input rejected or sanitized, no DB error exposed", "High", page_url,
                         [f"Open browser and navigate to '{page_url}'.",
-                         f"Enter '\\' OR \\'1\\'=\\'1' in the '{target['name']}' field.",
+                         enter_step("' OR '1'='1", target["name"]),
                          f"Find button with text '{btn_text}' and click().",
                          "Assert that the page/response reflects: 'input rejected or sanitized'."]))
                     tc_idx += 1
@@ -580,24 +675,6 @@ class SmartTestGeneratorAgent:
                          f"Find button with text '{btn_text}' and click().",
                          "Assert that the page/response reflects: 'script not executed, sanitized'."]))
                     tc_idx += 1
-
-                # Performance
-                cases.append(self._tc2(tc_idx, comp_name, "Performance",
-                    f"{fname} form submission response time",
-                    [f"Navigate to {page_url}", "Fill all fields with valid data", f"Click '{btn_text}'", "Measure response time"],
-                    "Form submission completes within 3 seconds", "Medium", page_url,
-                    [f"Open browser and navigate to '{page_url}'.",
-                     f"Assert that the page/response reflects: 'response within 3 seconds'."]))
-                tc_idx += 1
-
-                # Usability
-                cases.append(self._tc2(tc_idx, comp_name, "Usability",
-                    f"Tab navigation through {fname} form fields",
-                    [f"Navigate to {page_url}", "Press Tab to move through each field", "Verify logical tab order"],
-                    "Focus moves through fields in logical order", "Low", page_url,
-                    [f"Open browser and navigate to '{page_url}'.",
-                     "Assert that the page/response reflects: 'tab order is logical'."]))
-                tc_idx += 1
 
                 suites.setdefault(comp_name, []).extend(cases)
 
@@ -631,7 +708,7 @@ class SmartTestGeneratorAgent:
             suites["Page Load"] = [
                 self._tc2(1, "Page Load", "Functional", "Page loads successfully",
                     [f"Navigate to {url}", "Verify page loads"],
-                    "Page loads within 3 seconds", "Critical", url,
+                    "Page loads successfully", "Critical", url,
                     [f"Open browser and navigate to '{url}'.", "Assert that the page/response reflects: 'page loaded'."]),
                 self._tc2(2, "Page Load", "Negative", "Invalid URL path returns error",
                     [f"Navigate to {url}/nonexistent", "Verify error page"],

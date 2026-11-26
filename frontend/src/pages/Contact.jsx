@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mail, User, MessageSquare, Send, CheckCircle, Github, Twitter, Linkedin } from "lucide-react";
+import { Mail, User, MessageSquare, Send, CheckCircle } from "lucide-react";
 import { submitContact } from "../services/api";
 import useStore from "../state/store";
 import Button from "../components/Button";
@@ -131,25 +131,11 @@ export default function Contact() {
             })}
 
             <Card hover={false}>
-              <h3 className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-3">Follow us</h3>
-              <div className="flex gap-3">
-                {[{ icon: Twitter, label: "Twitter", href: "#" }, { icon: Github, label: "GitHub", href: "#" }, { icon: Linkedin, label: "LinkedIn", href: "#" }].map((s) => {
-                  const Icon = s.icon;
-                  return (
-                    <a key={s.label} href={s.href} aria-label={s.label} className="w-10 h-10 rounded-xl glass flex items-center justify-center text-white/40 hover:text-white hover:bg-white/10 transition-all">
-                      <Icon size={16} />
-                    </a>
-                  );
-                })}
-              </div>
-            </Card>
-
-            <Card hover={false}>
               <h3 className="text-xs font-semibold text-white/40 uppercase tracking-wider mb-2">FAQ</h3>
               <div className="space-y-3 text-sm">
                 {[
                   { q: "Is there a free plan?", a: "Yes! Free forever with 10 generations/month." },
-                  { q: "Can I cancel anytime?", a: "Yes, no commitments. Cancel with one click." },
+                  { q: "Will I be billed again?", a: "No. Paid plans are a one-time payment and nothing renews automatically." },
                 ].map((faq) => (
                   <div key={faq.q}>
                     <p className="font-medium text-white/70">{faq.q}</p>

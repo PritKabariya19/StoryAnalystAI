@@ -15,6 +15,10 @@ log = logging.getLogger(__name__)
 
 jobs = {}
 
+JOB_TTL = 60 * 60          # finished jobs are kept this long
+STALE_JOB_TTL = 24 * 60 * 60  # any job older than this is dropped
+MAX_POLL_FAILURES = 20     # in a row, 3s apart
+
 
 def headers():
     return {"X-Internal-Secret": settings.INTERNAL_API_SECRET}
@@ -65,7 +69,16 @@ def execute_on_python(test_cases, workers, headless):
     return data
 
 
+def purge():
+    now = time.monotonic()
+    for job_id, job in list(jobs.items()):
+        finished = job.get("finishedAt")
+        if (finished is not None and now - finished > JOB_TTL) or now - job["startedAt"] > STALE_JOB_TTL:
+            jobs.pop(job_id, None)
+
+
 def create(total, **extra):
+    purge()
     job_id = f"job_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
     jobs[job_id] = {
         "status": "running", "progress": 0, "total": total, "results": [],
@@ -89,6 +102,7 @@ def _run_single(job_id, test_cases, workers, headless):
         data = execute_on_python(test_cases, workers, headless)
         results = data["results"]
         jobs[job_id] = {
+            **jobs[job_id], "finishedAt": time.monotonic(),
             "status": "done", "progress": total, "total": total, "results": results,
             "summary": data.get("summary") or {"total": len(results), **count_statuses(results)},
             "error": None,
@@ -96,6 +110,7 @@ def _run_single(job_id, test_cases, workers, headless):
     except Exception as exc:
         log.error("[tests/start] Python failed: %s", exc)
         jobs[job_id] = {
+            **jobs[job_id], "finishedAt": time.monotonic(),
             "status": "failed", "progress": 0, "total": total, "results": [],
             "summary": {"total": total, "passed": 0, "failed": total, "errored": total},
             "error": failure_message(exc),
@@ -103,13 +118,18 @@ def _run_single(job_id, test_cases, workers, headless):
 
 
 def _poll_batch(job_id, python_job_id):
-    """Every 3s, copy the Python batch job's state into the local job."""
-    while jobs[job_id]["status"] == "running":
+    """Every 3s, copy the Python batch job's state into the local job. Give up
+    if the job is gone or the service stays unreachable."""
+    failures = 0
+    while jobs.get(job_id, {}).get("status") == "running":
         time.sleep(3)
         try:
             response = requests.get(
                 f"{settings.PYTHON_AI_URL}/batch-status/{python_job_id}", headers=headers(), timeout=8
             )
+            if response.status_code == 404:
+                _fail_batch(job_id, "The AI service no longer has this job. It may have restarted.")
+                return
             response.raise_for_status()
             data = response.json()
             job = jobs[job_id]
@@ -122,12 +142,23 @@ def _poll_batch(job_id, python_job_id):
                 "summary": data.get("summary") or {"total": total, **count_statuses(results)},
             }
             if data.get("status") == "done":
-                update.update(status="done", progress=total)
+                update.update(status="done", progress=total, finishedAt=time.monotonic())
             elif data.get("status") == "failed":
-                update.update(status="failed", error=data.get("error") or "Unknown batch error")
+                update.update(status="failed", error=data.get("error") or "Unknown batch error",
+                              finishedAt=time.monotonic())
             jobs[job_id] = update
+            failures = 0
         except Exception as exc:
             log.warning("[tests/start-batch] Poll error: %s", exc)
+            failures += 1
+            if failures >= MAX_POLL_FAILURES:
+                _fail_batch(job_id, "Lost contact with the AI service.")
+
+
+def _fail_batch(job_id, message):
+    job = jobs.get(job_id)
+    if job:
+        jobs[job_id] = {**job, "status": "failed", "error": message, "finishedAt": time.monotonic()}
 
 
 def run_single_in_background(job_id, test_cases, workers, headless):

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import secrets
@@ -15,6 +16,19 @@ log = logging.getLogger(__name__)
 
 # In-memory report store (always works, even without Firestore).
 mem_reports = {}
+
+# Firestore rejects documents over 1 MiB.
+MAX_DOC_BYTES = 900_000
+
+
+def _fit_for_firestore(report):
+    """Drop the bulky step logs if the report is too large for one document."""
+    if len(json.dumps(report).encode()) <= MAX_DOC_BYTES or not isinstance(report["results"], list):
+        return report
+    return {**report, "results": [
+        {k: v for k, v in r.items() if k != "log"} if isinstance(r, dict) else r
+        for r in report["results"]
+    ]}
 
 
 def _has_firestore():
@@ -40,14 +54,17 @@ def save(request):
 
     if _has_firestore():
         try:
-            _, ref = firebase.db().collection("reports").add(report)
+            _, ref = firebase.db().collection("reports").add(_fit_for_firestore(report))
             return JsonResponse({"id": ref.id, "saved": True})
         except Exception as exc:
             log.warning("[reports/save] Firestore failed, falling back to memory: %s", exc)
 
     report_id = f"rep_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
     mem_reports[report_id] = {"id": report_id, **report}
-    return JsonResponse({"id": report_id, "saved": True, "storage": "memory"})
+    return JsonResponse({
+        "id": report_id, "saved": True, "storage": "memory",
+        "warning": "Report is only kept in the server's memory and will be lost when it restarts.",
+    })
 
 
 @api("GET", auth=True)
@@ -59,20 +76,27 @@ def list_reports(request):
         reverse=True,
     )
 
-    if _has_firestore():
+    if not _has_firestore():
+        return JsonResponse({"reports": in_memory})
+    try:
+        query = firebase.db().collection("reports").where(filter=FieldFilter("userId", "==", uid))
         try:
-            query = (
-                firebase.db().collection("reports")
-                .where(filter=FieldFilter("userId", "==", uid))
-                .order_by("timestamp", direction="DESCENDING")
-                .limit(50)
-            )
-            stored = [{"id": doc.id, **doc.to_dict()} for doc in query.stream()]
-            return JsonResponse({"reports": in_memory + stored})
+            docs = list(query.order_by("timestamp", direction="DESCENDING").limit(50).stream())
+            stored = [{"id": doc.id, **doc.to_dict()} for doc in docs]
         except Exception as exc:
-            log.warning("[reports/list] Firestore failed, returning memory store: %s", exc)
-
-    return JsonResponse({"reports": in_memory})
+            # Usually the composite index is missing (firestore.indexes.json).
+            log.warning("[reports/list] Ordered query failed, sorting here instead: %s", exc)
+            stored = sorted(
+                ({"id": doc.id, **doc.to_dict()} for doc in query.stream()),
+                key=lambda r: r.get("timestamp") or 0, reverse=True,
+            )[:50]
+        return JsonResponse({"reports": in_memory + stored})
+    except Exception as exc:
+        log.warning("[reports/list] Firestore failed, returning memory store: %s", exc)
+        return JsonResponse({
+            "reports": in_memory,
+            "warning": "Saved reports could not be loaded. Only reports held in memory are shown.",
+        })
 
 
 @api("DELETE", auth=True)

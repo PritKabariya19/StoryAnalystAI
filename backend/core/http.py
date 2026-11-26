@@ -1,6 +1,7 @@
 """Request helpers shared by all views."""
 import json
 import math
+import re
 from datetime import datetime, timezone
 from functools import wraps
 
@@ -8,6 +9,8 @@ from django.core.exceptions import RequestDataTooBig
 from django.http import JsonResponse
 
 from core.auth import verify_token
+
+EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 
 
 def error(message, status, **extra):

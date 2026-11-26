@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Play, CheckCircle, XCircle, AlertCircle, Image, Download, Save,
          ChevronLeft, ChevronRight, Activity, Cpu, Zap, ListFilter, Hash } from "lucide-react";
@@ -145,6 +145,9 @@ export default function TestExecutorTab() {
             original_tc: tc,
           };
         });
+        // Stop polling an older run so its results can't land on the new tests
+        clearInterval(pollRef.current);
+        setLoading(false);
         setGeneratedTests(mapped);
         setExecutedResults([]);
         setJob(null);
@@ -194,10 +197,12 @@ export default function TestExecutorTab() {
       }
       console.log("[TestExecutor] Job started:", startResp);
       const { jobId } = startResp;
+      let pollFailures = 0;
 
       pollRef.current = setInterval(async () => {
         try {
           const status = await pollTestJob(jobId);
+          pollFailures = 0;
           console.log("[TestExecutor] Poll response:", { status: status.status, progress: status.progress, total: status.total, resultsCount: status.results?.length });
           setJob(status);
 
@@ -250,6 +255,7 @@ export default function TestExecutorTab() {
           }
         } catch (pollErr) {
           console.error("[TestExecutor] Polling error:", pollErr);
+          if (++pollFailures < 5) return; // ride out short outages
           clearInterval(pollRef.current);
           setLoading(false);
           addToast(`Polling error: ${pollErr.message || "Check backend connection."}`, "error");
@@ -269,8 +275,8 @@ export default function TestExecutorTab() {
     }
     setSaving(true);
     try {
-      await saveReport("test", executedResults, job?.summary || {}, {});
-      addToast("Report saved! View it in the Reports tab.", "success");
+      const saved = await saveReport("test", executedResults, job?.summary || {}, {});
+      addToast(saved.warning || "Report saved! View it in the Reports tab.", saved.warning ? "warning" : "success");
     } catch (err) {
       addToast("Save failed: " + err.message, "error");
     } finally {
@@ -518,7 +524,7 @@ export default function TestExecutorTab() {
                 <AlertCircle size={36} className="text-white/10 mb-3" />
                 <p className="text-white/30 text-sm">
                   No test cases yet.<br />
-                  Go to the <span className="text-white/60">Combined</span> tab and generate tests first.
+                  Go to the <span className="text-white/60">Smart Test Gen</span> tab and generate tests first.
                 </p>
               </div>
             ) : (

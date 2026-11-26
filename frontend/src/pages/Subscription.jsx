@@ -23,7 +23,7 @@ const PLANS = [
     name: "Pro",
     price: 19900,
     display: "₹199",
-    period: "/month",
+    period: " one-time",
     color: "border-brand-blue",
     badge: "Most Popular",
     features: ["100 AI generations / month", "All Free features", "Combined Generator", "Test Executor", "PDF & CSV Reports", "Priority Support", "Usage Analytics"],
@@ -36,7 +36,7 @@ const PLANS = [
     name: "Premium",
     price: 49900,
     display: "₹499",
-    period: "/month",
+    period: " one-time",
     color: "border-brand-purple",
     badge: "Best Value",
     features: ["Unlimited generations", "All Pro features", "Advanced Analytics", "API Access (coming soon)", "Dedicated Support", "Custom Integrations", "White-label Reports"],
@@ -59,7 +59,12 @@ export default function Subscription() {
       const order = await createRazorpayOrder(planId);
 
       if (order.mock) {
-        // Mock payment flow (no Razorpay keys configured)
+        // Mock payment flow (PAYMENTS_MOCK=true on the backend)
+        await verifyRazorpayPayment({
+          orderId:   order.orderId,
+          paymentId: `mock_pay_${Date.now()}`,
+          plan: planId,
+        });
         addToast("Mock payment successful! Plan upgraded.", "success");
         setPlan(planId);
         setSuccessPlan(planId);
@@ -77,7 +82,13 @@ export default function Subscription() {
       })();
 
       if (!window.Razorpay) {
-        await new Promise((res) => { script.onload = res; });
+        await new Promise((resolve, reject) => {
+          script.addEventListener("load", resolve);
+          script.addEventListener("error", () => {
+            script.remove(); // so the next click loads it again
+            reject(new Error("Could not load Razorpay checkout."));
+          });
+        });
       }
 
       const rzp = new window.Razorpay({
@@ -104,6 +115,8 @@ export default function Subscription() {
             }
           } catch (err) {
             addToast("Payment verification failed: " + err.message, "error");
+          } finally {
+            setLoading(null);
           }
         },
         modal: { ondismiss: () => setLoading(null) },
@@ -212,8 +225,9 @@ export default function Subscription() {
         >
           <AlertCircle size={15} className="text-white/30 flex-shrink-0 mt-0.5" />
           <p className="text-xs text-white/30">
-            Payments are securely processed via Razorpay. All plans are monthly with no contracts.
-            If Razorpay is not configured, payments run in mock mode for testing.
+            Payments are securely processed via Razorpay. Paid plans are a one-time payment and nothing renews automatically.
+            Generation limits reset every month.
+            Without Razorpay, upgrades work only if test mode is turned on.
           </p>
         </motion.div>
       </div>

@@ -4,6 +4,7 @@ Rule-Based Test Case Generator (fallback engine)
 Converts a StoryAnalysis into a full TestSuite — no LLM needed.
 """
 
+from agents.text_match import has_word
 from models.story_model import StoryAnalysis, TestCase, TestSuite
 
 
@@ -14,7 +15,7 @@ class RuleGenerator:
                    "locked", "disabled", "below", "unregistered"]
     BOUNDARY_KW = ["minimum", "maximum", "exactly", "at least", "at most", "length",
                    "size", "limit", "min", "max"]
-    EDGE_KW     = ["special char", "sql injection", "xss", "whitespace", "emoji",
+    EDGE_KW     = ["special char", "special character", "sql injection", "xss", "whitespace", "emoji",
                    "concurrent", "timeout", "network", "interrupt", "very long", "script"]
 
     def generate(self, analysis: StoryAnalysis) -> TestSuite:
@@ -25,9 +26,9 @@ class RuleGenerator:
 
     def _classify(self, c):
         cl = c.lower()
-        if any(k in cl for k in self.EDGE_KW):    return "Edge Case", "Medium"
-        if any(k in cl for k in self.BOUNDARY_KW): return "Boundary",  "Medium"
-        if any(k in cl for k in self.NEGATIVE_KW): return "Negative",  "High"
+        if has_word(cl, self.EDGE_KW):    return "Edge Case", "Medium"
+        if has_word(cl, self.BOUNDARY_KW): return "Boundary",  "Medium"
+        if has_word(cl, self.NEGATIVE_KW): return "Negative",  "High"
         return "Positive", "High"
 
     def _build(self, idx, condition, feature, role):

@@ -16,6 +16,21 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from agents.text_match import has_word
+
+
+def enter_step(value: str, field: str) -> str:
+    """An executor step that types `value`. The value is wrapped in whichever
+    quote it doesn't contain, because the step parser has no escaping."""
+    quote = '"' if "'" in value else "'"
+    return f"Enter {quote}{value}{quote} in the '{field}' field."
+
+
+def first_option(options: list) -> str:
+    """Value of the first real dropdown option (placeholders have no value).
+    If none is known, the executor will report the step as not verified."""
+    return next((o["value"] for o in options or [] if o.get("value")), "unknown option")
+
 
 @dataclass
 class CombinedTestCase:
@@ -58,7 +73,7 @@ class CombinedGeneratorAgent:
                    "unregistered", "incorrect"]
     BOUNDARY_KW = ["minimum", "maximum", "exactly", "at least", "at most",
                    "length", "size", "limit", "min", "max", "boundary"]
-    EDGE_KW     = ["special char", "sql injection", "xss", "whitespace",
+    EDGE_KW     = ["special char", "special character", "sql injection", "xss", "whitespace",
                    "emoji", "concurrent", "timeout", "network", "interrupt",
                    "very long", "script", "injection"]
 
@@ -214,9 +229,9 @@ class CombinedGeneratorAgent:
     # ── Classify condition type ────────────────────────────────────────────
     def _classify(self, condition: str):
         cl = condition.lower()
-        if any(k in cl for k in self.EDGE_KW):    return "Edge Case", "Medium"
-        if any(k in cl for k in self.BOUNDARY_KW): return "Boundary",  "Medium"
-        if any(k in cl for k in self.NEGATIVE_KW): return "Negative",  "High"
+        if has_word(cl, self.EDGE_KW):    return "Edge Case", "Medium"
+        if has_word(cl, self.BOUNDARY_KW): return "Boundary",  "Medium"
+        if has_word(cl, self.NEGATIVE_KW): return "Negative",  "High"
         return "Positive", "High"
 
     # ── Build a mapped test case ───────────────────────────────────────────
@@ -305,7 +320,7 @@ class CombinedGeneratorAgent:
             for fld in fields:
                 fname = fld.get("name", fld.get("type", "field"))
                 ftype = fld.get("type", "text")
-                value = self._pick_value(fname, ftype, action_hint, tc_type)
+                value = self._pick_value(fname, ftype, action_hint, tc_type, fld.get("options"))
                 manual.append(
                     f"In the '{form_name}' form, locate the '{fname}' field ({ftype}) "
                     f"and enter: {value if value != '' else '(leave empty)'}."
@@ -313,7 +328,7 @@ class CombinedGeneratorAgent:
                 if value == "":
                     auto.append(f"Clear the '{fname}' field.")
                 else:
-                    auto.append(f"Enter '{value}' in the '{fname}' field.")
+                    auto.append(enter_step(value, fname))
         else:
             manual.append(f"Locate the relevant input area on '{page_title}'.")
             auto.append(f"# No form fields extracted — locate inputs manually on {url}.")
@@ -345,7 +360,8 @@ class CombinedGeneratorAgent:
             pass
         return "Sign Up"
 
-    def _pick_value(self, fname: str, ftype: str, action_hint: str, tc_type: str) -> str:
+    def _pick_value(self, fname: str, ftype: str, action_hint: str, tc_type: str,
+                    options: list = None) -> str:
         """Choose a realistic test value for a field based on condition context.
         Returns a BARE string (no surrounding quotes) — the caller embeds it.
         """
@@ -361,7 +377,8 @@ class CombinedGeneratorAgent:
 
         if tc_type in ("Negative", "Edge Case") and is_targeted:
             if "empty" in al or "blank" in al or "missing" in al:
-                return ""  # intentionally empty — leave blank
+                # intentionally empty: leave blank (a checkbox is left unticked)
+                return "false" if ftype == "checkbox" else ""
             if "sql" in al or "injection" in al:
                 return "' OR '1'='1"
             if "xss" in al or "script" in al:
@@ -378,6 +395,13 @@ class CombinedGeneratorAgent:
                 return "wrongpassword123"
             return "invalid_test_value"
 
+        # A checkbox or dropdown that this test doesn't target gets a real value
+        if not (tc_type == "Boundary" and is_targeted):
+            if ftype == "checkbox":
+                return "true"
+            if ftype == "select":
+                return first_option(options)
+
         if tc_type == "Boundary" and is_targeted:
             if "minimum" in al or "min" in al:
                 return "a"  # 1 character — minimum boundary
@@ -390,8 +414,6 @@ class CombinedGeneratorAgent:
         if ftype == "password":  return "ValidPass@123"
         if ftype == "tel":       return "9876543210"
         if ftype == "number":    return "42"
-        if ftype == "checkbox":  return "check the checkbox"
-        if ftype == "select":    return "select a valid option from dropdown"
         if "name" in fl:         return "John Doe"
         if "user" in fl:         return "testuser"
         if "title" in fl:        return "Senior Software Engineer"

@@ -31,6 +31,10 @@ services:
           type: web
           name: storyanalyst-ai
           envVarKey: INTERNAL_API_SECRET
+      - key: JWT_SECRET
+        generateValue: true
+      - key: TRUSTED_PROXY_COUNT
+        value: "1"
       - key: PYTHON_AI_URL
         fromService:
           type: web
@@ -41,6 +45,12 @@ services:
       - key: FIREBASE_SERVICE_ACCOUNT_BASE64
         sync: false
       - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
         sync: false
 
   - type: web

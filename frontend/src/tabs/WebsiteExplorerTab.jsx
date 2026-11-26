@@ -193,7 +193,7 @@ export default function WebsiteExplorerTab() {
     try {
       const data = await exploreWebsite(url, depth);
       setOutput(data);
-      if (data.usageCount) setUsageCount(data.usageCount);
+      if (data.usageCount != null) setUsageCount(data.usageCount);
       if (data.mock) addToast("Showing demo data — explorer unavailable.", "warning");
       else addToast("Website explored successfully!", "success");
     } catch (err) {
@@ -206,8 +206,9 @@ export default function WebsiteExplorerTab() {
   async function handleSave() {
     if (!output) return;
     try {
-      await saveReport("explorer", output.pages || [], output, { url });
-      addToast("Exploration report saved!", "success");
+      const { pages = [], ...summary } = output;
+      const saved = await saveReport("explorer", pages, summary, { url });
+      addToast(saved.warning || "Exploration report saved!", saved.warning ? "warning" : "success");
     } catch (err) { addToast("Failed to save: " + err.message, "error"); }
   }
 

@@ -21,14 +21,33 @@ def _read():
 
 
 def get_user_by_email(email):
-    return next((u for u in _read() if u.get("email") == email), None)
+    """Case-insensitive. An exact match wins, for older accounts that differ only by case."""
+    users = _read()
+    wanted = str(email or "").casefold()
+    return (next((u for u in users if u.get("email") == email), None)
+            or next((u for u in users if str(u.get("email", "")).casefold() == wanted), None))
+
+
+def set_plan(uid, plan, order_id):
+    """Save a new plan and reset usage, once per order. Return False if the user isn't local."""
+    with _lock:
+        users = _read()
+        user = next((u for u in users if u.get("uid") == uid), None)
+        if user is None:
+            return False
+        paid = user.get("paidOrders") or []
+        if order_id and order_id in paid:
+            return True
+        user.update(plan=plan, usageCount=0, paidOrders=paid + [order_id] if order_id else paid)
+        settings.USERS_FILE.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
+        return True
 
 
 def create_user(email, name, password_hash):
     """Return the new user, or None if the email is already registered."""
     with _lock:
         users = _read()
-        if any(u.get("email") == email for u in users):
+        if any(str(u.get("email", "")).casefold() == email.casefold() for u in users):
             return None
         suffix = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(9))
         user = {

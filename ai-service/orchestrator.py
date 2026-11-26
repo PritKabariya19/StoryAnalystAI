@@ -1,26 +1,24 @@
 """
 Orchestrator  —  Hybrid: LLM-first with Rule-Based Fallback
 -------------------------------------------------------------
-1. Tries Google Gemini (single call, gemini-2.0-flash-lite).
+1. Tries Google Gemini (single call, model set by GEMINI_MODEL).
 2. On ANY API error (429 quota, network, etc.) automatically falls back
    to the built-in rule-based engine — the app ALWAYS works.
 """
 
 import json
+import logging
 import re
 import time
-import google.generativeai as genai
 
-from config import GEMINI_API_KEY
+from agents import llm
 from models.story_model import StoryAnalysis, TestCase, TestSuite
 
 # ── rule-based engines (always available) ─────────────────────────────────
 from engines.rule_analyst import RuleAnalyst
 from engines.rule_generator import RuleGenerator
 
-genai.configure(api_key=GEMINI_API_KEY)
-
-_MODEL_NAME = "gemini-2.5-flash"
+log = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are a combined QA Story Analyst and Test Case Generator.
 
@@ -61,10 +59,6 @@ must be make sure that the test cases are comprehensive and cover all the edge c
 
 class Orchestrator:
     def __init__(self):
-        self._model = genai.GenerativeModel(
-            model_name=_MODEL_NAME,
-            system_instruction=_SYSTEM_PROMPT,
-        )
         self._rule_analyst = RuleAnalyst()
         self._rule_generator = RuleGenerator()
 
@@ -76,11 +70,12 @@ class Orchestrator:
             raw = self._call_with_retry(user_story)
             data = self._parse_json(raw)
             if self._valid(data):
-                return self._build_result_from_llm(data, user_story)
+                return {**self._build_result_from_llm(data, user_story), "ai_generated": True}
+            log.warning("Gemini response was not usable; using the rule-based engine.")
         except Exception:
-            pass  # fall through to rule-based
+            log.exception("Gemini call failed; using the rule-based engine.")
 
-        return self._run_rule_based(user_story)
+        return {**self._run_rule_based(user_story), "ai_generated": False}
 
     # ── LLM path ───────────────────────────────────────────────────────────
 
@@ -89,7 +84,7 @@ class Orchestrator:
         wait = 3
         for attempt in range(max_retries):
             try:
-                return self._model.generate_content(prompt).text.strip()
+                return llm.generate(prompt, _SYSTEM_PROMPT, as_json=True)
             except Exception as exc:
                 err = str(exc)
                 if ("429" in err or "quota" in err.lower()) and attempt < max_retries - 1:

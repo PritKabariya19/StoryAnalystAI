@@ -11,5 +11,8 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn \
 
 COPY . .
 
+# Refuse private and internal addresses in a deployment (see agents/url_guard.py).
+ENV BLOCK_PRIVATE_URLS=true
+
 # One worker: the latest report is held in memory.
 CMD gunicorn app:app --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 8 --timeout 0 --access-logfile -

@@ -11,12 +11,12 @@ Routes:
   POST /generate-combined   → story + site → combined test cases
   POST /execute             → combined test cases → execution results
   POST /report              → execution results → HTML report
-  GET  /report/download     → download latest report as .html file
   GET  /screenshots/<f>     → serve screenshot files
 """
 
 from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 from orchestrator import Orchestrator
 from agents.website_explorer import WebsiteExplorerAgent
 from agents.website_extractor import WebsiteExtractorAgent
@@ -24,7 +24,11 @@ from agents.combined_generator import CombinedGeneratorAgent
 from agents.smart_test_generator import SmartTestGeneratorAgent
 from agents.test_executor import TestExecutorAgent
 from agents.report_agent import ReportAgent
+import hmac
 import os
+import threading
+import time
+import uuid
 
 app = Flask(__name__)
 
@@ -35,13 +39,68 @@ CORS(app, origins=[
 ])
 
 # Internal secret — requests must include X-Internal-Secret header
-INTERNAL_SECRET = os.environ.get("INTERNAL_API_SECRET", "dev_secret_change_me")
+# These values are public (they are in the source), so they protect nothing.
+PUBLIC_SECRETS = {"", "dev_secret_change_me", "change_this_to_a_random_secret_string"}
+INTERNAL_SECRET = os.environ.get("INTERNAL_API_SECRET") or "dev_secret_change_me"
+
 
 def check_secret():
     secret = request.headers.get("X-Internal-Secret", "")
-    if secret != INTERNAL_SECRET:
+    if not hmac.compare_digest(secret.encode(), INTERNAL_SECRET.encode()):
         return jsonify({"error": "Unauthorized — missing internal secret."}), 403
+    if INTERNAL_SECRET in PUBLIC_SECRETS and request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"error": "Set INTERNAL_API_SECRET to accept remote callers."}), 403
     return None
+
+
+class BadInput(ValueError):
+    pass
+
+
+@app.errorhandler(BadInput)
+def bad_input(exc):
+    return jsonify({"error": str(exc)}), 400
+
+
+@app.errorhandler(Exception)
+def unexpected_error(exc):
+    if isinstance(exc, HTTPException):
+        return jsonify({"error": exc.description}), exc.code
+    app.logger.exception("Unhandled error")
+    return jsonify({"error": "Internal error in the AI service."}), 500
+
+
+def _body() -> dict:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise BadInput("The request body must be a JSON object.")
+    return data
+
+
+def _text(data: dict, key: str) -> str:
+    value = data.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise BadInput(f"'{key}' must be text.")
+    return value.strip()
+
+
+def _int(data: dict, key: str, default):
+    value = data.get(key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise BadInput(f"'{key}' must be a whole number.")
+
+
+def _test_cases(data: dict) -> list:
+    cases = data.get("test_cases", [])
+    if not isinstance(cases, list) or not all(isinstance(tc, dict) for tc in cases):
+        raise BadInput("'test_cases' must be a list of objects.")
+    return cases
 
 orchestrator = Orchestrator()
 explorer     = WebsiteExplorerAgent()
@@ -50,8 +109,6 @@ combiner     = CombinedGeneratorAgent()
 smart_gen    = SmartTestGeneratorAgent()
 executor     = TestExecutorAgent()
 reporter     = ReportAgent()
-
-_last_report_html: str = ""
 
 
 @app.route("/health")
@@ -64,8 +121,8 @@ def analyze():
     err = check_secret()
     if err: return err
 
-    data = request.get_json()
-    user_story = (data or {}).get("story", "").strip()
+    data = _body()
+    user_story = _text(data, "story")
     if not user_story:
         return jsonify({"error": "No user story provided."}), 400
     try:
@@ -79,9 +136,9 @@ def explore():
     err = check_secret()
     if err: return err
 
-    data  = request.get_json()
-    url   = (data or {}).get("url", "").strip()
-    depth = int((data or {}).get("depth", 1))
+    data  = _body()
+    url   = _text(data, "url")
+    depth = max(0, _int(data, "depth", 1))
     if not url:
         return jsonify({"error": "No URL provided."}), 400
     try:
@@ -95,10 +152,10 @@ def generate_combined():
     err = check_secret()
     if err: return err
 
-    data       = request.get_json() or {}
-    user_story = data.get("story", "").strip()
-    url        = data.get("url", "").strip()
-    depth      = int(data.get("depth", 1))
+    data       = _body()
+    user_story = _text(data, "story")
+    url        = _text(data, "url")
+    depth      = max(0, _int(data, "depth", 1))
     if not user_story:
         return jsonify({"error": "No user story provided."}), 400
     if not url:
@@ -134,10 +191,10 @@ def execute():
     err = check_secret()
     if err: return err
 
-    data       = request.get_json() or {}
-    test_cases = data.get("test_cases", [])
-    headless   = data.get("headless", True)
-    workers    = max(1, min(int(data.get("workers", 1)), 8))  # 1–8 parallel browser instances
+    data       = _body()
+    test_cases = _test_cases(data)
+    headless   = data.get("headless", True) is not False
+    workers    = max(1, min(_int(data, "workers", 1), 8))  # 1–8 parallel browser instances
 
     if not test_cases:
         return jsonify({"error": "No test cases provided."}), 400
@@ -160,8 +217,16 @@ def execute():
 
 
 # In-memory batch-job store  { job_id -> { status, progress, total, results, summary, error } }
-import uuid as _uuid
 _batch_jobs: dict = {}
+BATCH_JOB_TTL = 60 * 60  # seconds a finished job is kept
+
+
+def _purge_batch_jobs():
+    cutoff = time.time() - BATCH_JOB_TTL
+    for job_id, job in list(_batch_jobs.items()):
+        if job.get("finished_at", cutoff + 1) < cutoff:
+            _batch_jobs.pop(job_id, None)
+
 
 @app.route("/execute-batch", methods=["POST"])
 def execute_batch_start():
@@ -169,23 +234,24 @@ def execute_batch_start():
     err = check_secret()
     if err: return err
 
-    data        = request.get_json() or {}
-    test_cases  = data.get("test_cases", [])
-    start_index = int(data.get("start_index", 0))
-    end_index   = data.get("end_index", None)
-    if end_index is not None:
-        end_index = int(end_index)
-    batch_size  = max(1, int(data.get("batch_size", 5)))
-    headless    = data.get("headless", True)
-    workers     = max(1, min(int(data.get("workers", 1)), 8))
+    data        = _body()
+    test_cases  = _test_cases(data)
+    start_index = _int(data, "start_index", 0)
+    end_index   = _int(data, "end_index", None)
+    batch_size  = max(1, _int(data, "batch_size", 5))
+    headless    = data.get("headless", True) is not False
+    workers     = max(1, min(_int(data, "workers", 1), 8))
 
     if not test_cases:
         return jsonify({"error": "No test cases provided."}), 400
 
-    actual_end = end_index if end_index is not None else len(test_cases)
-    total_in_range = max(0, actual_end - start_index)
+    start_index = max(0, min(start_index, len(test_cases)))
+    end_index = len(test_cases) if end_index is None else max(start_index, min(end_index, len(test_cases)))
+    total_in_range = end_index - start_index
 
-    job_id = str(_uuid.uuid4())
+    _purge_batch_jobs()
+
+    job_id = str(uuid.uuid4())
     _batch_jobs[job_id] = {
         "status":   "running",
         "progress": 0,
@@ -219,6 +285,7 @@ def execute_batch_start():
 
             _batch_jobs[job_id].update({
                 "status":   "done",
+                "finished_at": time.time(),
                 "progress": total_in_range,
                 "results":  all_results,
                 "summary":  {
@@ -231,11 +298,11 @@ def execute_batch_start():
         except Exception as exc:
             _batch_jobs[job_id].update({
                 "status": "failed",
+                "finished_at": time.time(),
                 "error":  str(exc),
             })
 
-    import threading as _threading
-    _threading.Thread(target=_run, daemon=True).start()
+    threading.Thread(target=_run, daemon=True).start()
 
     return jsonify({"job_id": job_id, "status": "running", "total": total_in_range})
 
@@ -254,32 +321,19 @@ def batch_status(job_id):
 
 @app.route("/report", methods=["POST"])
 def generate_report():
-    global _last_report_html
     err = check_secret()
     if err: return err
 
-    data = request.get_json(silent=True) or {}
+    data = _body()
     results = data.get("results")
     if not isinstance(results, list) or not results:
         return jsonify({"error": "No execution results provided."}), 400
     try:
         html = reporter.generate(data)
-        _last_report_html = html
         return Response(html, mimetype="text/html")
     except Exception as exc:
         import traceback; traceback.print_exc()
         return jsonify({"error": f"Report generation failed: {exc}"}), 500
-
-
-@app.route("/report/download")
-def download_report():
-    if not _last_report_html:
-        return jsonify({"error": "No report generated yet. Run /report first."}), 404
-    return Response(
-        _last_report_html,
-        mimetype="text/html",
-        headers={"Content-Disposition": "attachment; filename=test_report.html"},
-    )
 
 
 @app.route("/generate-smart-tests", methods=["POST"])
@@ -287,11 +341,11 @@ def generate_smart_tests():
     err = check_secret()
     if err: return err
 
-    data  = request.get_json() or {}
-    url   = data.get("url", "").strip()
-    query = data.get("query", "").strip()
-    user_story = data.get("user_story", "").strip()
-    depth = int(data.get("depth", 1))
+    data  = _body()
+    url   = _text(data, "url")
+    query = _text(data, "query")
+    user_story = _text(data, "user_story")
+    depth = max(0, _int(data, "depth", 1))
     if not url:
         return jsonify({"error": "No URL provided."}), 400
     try:
@@ -306,10 +360,10 @@ def extract_info():
     err = check_secret()
     if err: return err
 
-    data  = request.get_json() or {}
-    url   = data.get("url", "").strip()
-    query = data.get("query", "").strip()
-    depth = int(data.get("depth", 1))
+    data  = _body()
+    url   = _text(data, "url")
+    query = _text(data, "query")
+    depth = max(0, _int(data, "depth", 1))
     if not url:
         return jsonify({"error": "No URL provided."}), 400
     try:
@@ -321,10 +375,14 @@ def extract_info():
 
 @app.route("/screenshots/<path:filename>")
 def serve_screenshot(filename):
+    err = check_secret()
+    if err: return err
+
     screenshots_dir = os.path.join(os.path.dirname(__file__), "screenshots")
     return send_from_directory(screenshots_dir, filename)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Local only by default; set HOST=0.0.0.0 to accept other machines.
+    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=port, debug=False)
