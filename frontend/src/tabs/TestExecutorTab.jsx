@@ -47,6 +47,12 @@ function ResultRow({ test, onViewScreenshot }) {
         {!test.errorMsg && test.execTime > 0 && (
           <p className="text-xs text-white/30">{Number(test.execTime).toFixed(2)}s</p>
         )}
+        {test.log && (
+          <details className="mt-1">
+            <summary className="text-xs text-white/40 cursor-pointer">What happened</summary>
+            <pre className="text-xs text-white/50 whitespace-pre-wrap break-all mt-1">{test.log}</pre>
+          </details>
+        )}
       </div>
 
       {/* Type */}
@@ -141,6 +147,7 @@ export default function TestExecutorTab() {
             description: tc.test_scenario || tc.condition || tc.title || "(no description)",
             status:      "Pending",
             screenshot:  null,
+            log:         null,
             execTime:    0,
             original_tc: tc,
           };
@@ -172,7 +179,7 @@ export default function TestExecutorTab() {
     setJob({ status: "running", progress: 0, total: generatedTests.length, results: [] });
 
     // Reset all statuses to Pending
-    const reset = generatedTests.map(t => ({ ...t, status: "Pending", screenshot: null, execTime: 0 }));
+    const reset = generatedTests.map(t => ({ ...t, status: "Pending", screenshot: null, log: null, execTime: 0 }));
     setGeneratedTests(reset);
     testsRef.current = reset;
 
@@ -231,6 +238,7 @@ export default function TestExecutorTab() {
                   screenshot: screenshotUrl,
                   execTime:   res.duration_seconds ?? res.execTime ?? 0,
                   errorMsg:   res.error || res.error_message || null,
+                  log:        res.log || null,
                 };
               } else {
                 console.warn("[TestExecutor] No row match for result:", { testId: res.testId, tc_id: res.tc_id, id: res.id });

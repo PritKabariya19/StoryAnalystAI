@@ -11,6 +11,7 @@ import requests
 
 import tests  # noqa: F401
 from agents import test_executor, url_guard
+from agents.smart_test_generator import SmartTestGeneratorAgent
 from agents.website_explorer import WebsiteExplorerAgent
 from agents.website_extractor import WebsiteExtractorAgent
 from tests.site import TEST_WEB, Site
@@ -23,6 +24,17 @@ PAGES = {
     "/moved": "redirect:/sub/index.html",
     "/upload": '<input id="f" type="file" onchange="this.files[0].text().then('
                "t => o.textContent = this.files[0].name + '|' + t)\"><p id='o'></p>",
+    "/links": '<a href="/sub/index.html">Merge PDF</a> <a href="/gone">Split PDF</a>',
+    # Like many converters: the file field is added by script, and the button
+    # appears only after a supported file is chosen
+    "/convert": """<div id="box"></div><button id="go" hidden>Convert to PDF</button><script>
+        const input = Object.assign(document.createElement('input'),
+                                    {type: 'file', accept: '.jpg', multiple: true});
+        input.onchange = () => go.hidden = !input.files[0].name.endsWith('.jpg');
+        box.append(input);
+        go.onclick = () => setTimeout(() => Object.assign(document.createElement('a'),
+            {href: URL.createObjectURL(new Blob(['%PDF-1.4 sample'])), download: 'out.pdf'}).click(), 500);
+        </script>""",
     "/private": "<p>INTERNAL-DATA</p>",
     "/redirect": f"redirect:{PRIVATE}/secret-redirect",
     "/embeds": f"<p>public page ok</p><img src='{PRIVATE}/secret-img'>"
@@ -69,6 +81,34 @@ class ExecutorTests(BrowserCase):
             {"automation_steps": [{"action": "hover"}]},
         )
         self.assertEqual([r["status"] for r in results], ["Pass", "Fail", "Fail", "Error"])
+
+    def test_link_clicks_happen_and_are_described(self):
+        def link(text, target):
+            return {"page_url": self.site.url + "/links", "automation_steps": [
+                f"Find link or button with text '{text}' and click().",
+                f"Assert that the URL contains '{target}'."]}
+        good, broken = self.run_cases(link("Merge PDF", "/sub/index.html"), link("Split PDF", "/gone"))
+        self.assertEqual([good["status"], broken["status"]], ["Pass", "Fail"])
+        self.assertIn(f"After click: went to {self.site.url}/sub/index.html", good["log"])
+        self.assertIn("Click led to HTTP 404", broken["error_message"])
+
+    def test_upload_task_is_generated_and_performed(self):
+        url = self.site.url + "/convert"
+        agent = SmartTestGeneratorAgent()
+        with mock.patch("agents.uploads.UPLOAD_SETTLE_MS", 500):
+            suites = agent._rule_based_fallback({"pages": [{"url": url}]}, "", url)
+        cases = suites[0]["test_cases"]
+        self.assertEqual(len(cases), 3)  # one file, two files, wrong type
+        results = self.run_cases(*cases)
+        self.assertEqual([r["status"] for r in results], ["Pass"] * 3, [r["log"] for r in results])
+        self.assertIn("downloaded 'out.pdf'", results[0]["log"])
+
+    def test_missing_download_fails(self):
+        steps = [{"action": "upload"}, {"action": "assert", "type": "download", "expected": ".pdf"}]
+        with mock.patch.object(test_executor, "DOWNLOAD_WAIT", 1):
+            result, = self.run_cases({"page_url": self.site.url + "/convert", "automation_steps": steps})
+        self.assertEqual(result["status"], "Fail")
+        self.assertIn("No file was downloaded", result["error_message"])
 
     def test_screenshot_names_cannot_be_guessed(self):
         names = [r["screenshot_path"] for r in self.run_cases(*[{"automation_steps": [see("Login")]}] * 2)]

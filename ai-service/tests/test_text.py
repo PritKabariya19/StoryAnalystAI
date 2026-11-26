@@ -1,9 +1,11 @@
 import unittest
 from unittest import mock
 
+from bs4 import BeautifulSoup
+
 import tests  # noqa: F401  (sets the environment)
 from agents.combined_generator import CombinedGeneratorAgent
-from agents.smart_test_generator import SmartTestGeneratorAgent
+from agents.smart_test_generator import SmartTestGeneratorAgent, _TEST_GEN_SYSTEM_PROMPT
 from agents.test_executor import _is_negative_tc
 from agents.url_guard import with_scheme
 from engines.rule_analyst import RuleAnalyst
@@ -60,3 +62,35 @@ class FallbackTests(unittest.TestCase):
         self.assertEqual(suites[0]["component"], "signup Form")
         types = {tc["test_type"] for suite in suites for tc in suite["test_cases"]}
         self.assertFalse(types & {"Performance", "Usability"})
+
+
+class SmartPromptTests(unittest.TestCase):
+    def test_prompt_states_the_limit(self):
+        self.assertIn("up to a maximum of 100", _TEST_GEN_SYSTEM_PROMPT)
+        self.assertNotIn("{max_cases}", _TEST_GEN_SYSTEM_PROMPT)
+
+    def test_cases_are_capped_across_suites(self):
+        suites = [{"component": c, "test_cases": [{}] * 60} for c in "ABC"]
+        capped = SmartTestGeneratorAgent._limit_cases(suites, 100)
+        self.assertEqual([len(s["test_cases"]) for s in capped], [60, 40])
+
+    def test_field_limits_and_choice_values_reach_the_ai(self):
+        soup = BeautifulSoup('<input type="password" minlength="8"><input type="radio" value="a">',
+                             "html.parser")
+        password, radio = [SmartTestGeneratorAgent._type_info(t) for t in soup("input")]
+        self.assertEqual(password, {"type": "password", "minlength": "8"})
+        self.assertEqual(radio, {"type": "radio", "value": "a"})
+
+    def test_javascript_repeat_in_reply_is_expanded(self):
+        raw = '{"test_suites": [{"value": "a".repeat(5) + "@example.com"}]}'
+        data = SmartTestGeneratorAgent()._parse_test_cases(raw)
+        self.assertEqual(data["test_suites"][0]["value"], "aaaaa@example.com")
+
+    def test_tests_that_cannot_run_are_dropped(self):
+        def suite(step):
+            return {"component": "A", "test_cases": [{"automation_steps": [step]}]}
+
+        runnable = [{"action": "upload"}, "Assert that the page/response reflects: 'error for email'."]
+        impossible = [{"action": "hover"}, "Assert that the page/response reflects: 'page loaded'."]
+        kept = SmartTestGeneratorAgent._runnable_only([suite(s) for s in runnable + impossible])
+        self.assertEqual([k["test_cases"][0]["automation_steps"][0] for k in kept], runnable)

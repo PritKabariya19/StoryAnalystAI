@@ -116,6 +116,7 @@ Run the checks for what you touched. Tests don't call Firebase, Razorpay or Gemi
 - `INTERNAL_API_SECRET` must match in `backend/.env` and `ai-service/.env`. If unset, both fall back to a public dev value, which the AI service accepts only from the same machine.
 - Login tokens are signed with `JWT_SECRET`. If unset, a random key is created in `backend/.data/jwt_secret`.
 - Test jobs and rate limits are held in memory, so keep gunicorn at one worker (see `backend/Procfile`).
+- Smart Test Gen opens up to 3 pages in Chromium and, where a page has a file field, uploads a generated sample file to the target site to find the controls that follow.
 - Screenshots are written to `ai-service/screenshots/` (gitignored), and the backend reads them from there. They are deleted after 7 days, on the next test run.
 
 ## Secrets

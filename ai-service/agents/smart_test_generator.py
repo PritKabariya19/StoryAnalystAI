@@ -17,9 +17,12 @@ import logging
 import re
 import time
 from typing import List, Dict
+from urllib.parse import urljoin, urlparse
 
 from agents import llm
 from agents.url_guard import check_url, request_proxies
+from agents.uploads import accepted_type, look_at_page
+from agents.test_executor import is_runnable
 from agents.website_extractor import WebsiteExtractorAgent
 from agents.combined_generator import CombinedGeneratorAgent, enter_step, first_option
 
@@ -29,18 +32,53 @@ log = logging.getLogger(__name__)
 # 8 testing types for Senior QA methodology
 TEST_TYPES = ["UI", "Functional", "Validation", "Boundary", "Negative", "Security"]
 
-_TEST_GEN_SYSTEM_PROMPT = """You are an expert QA Performance Engineer optimizing for extreme speed and efficiency (Antigravity Mode).
+MAX_TEST_CASES = 100
+MAX_CRAWL_CHARS = 40_000
+MAX_BROWSER_PAGES = 3  # pages also opened in Chromium; each takes several seconds
 
-Your job is to generate detailed, accurate test cases for any given feature or functionality, grouped by components.
+_TEST_GEN_SYSTEM_PROMPT = """You are a Senior QA Engineer who designs test cases from the web components of a real website.
+
+Your job is to test every component found in the crawl data, with test cases grouped by component.
 
 STEPS:
 1. Break the user story into Actor / Action / Goal.
-2. Identify website components from crawl data.
-3. Map components to the user story.
+2. List every component in the crawl data: each form, and each field, button, toggle, message area, link and heading.
+3. Map components to the user story. Components that serve the story come first and get the deepest coverage.
 4. Generate test cases GROUPED BY COMPONENT covering these testing types: UI, Functional, Validation, Boundary, Negative, Security.
 
+THE MAIN TASK COMES FIRST:
+- Before testing single components, write tests that perform the page's whole task from start to finish and check its result, e.g. upload a file, click the convert button, check that the file is downloaded; or fill a form, submit it and check the outcome.
+- A test must never stop at a click: it ends by checking what the task or the click produced.
+- File upload (from "file_uploads"): the whole task with one file; with several files if "multiple" is true; with a file type the field does not accept.
+- "after_upload" lists the controls that appeared after a sample file was uploaded. Use them for the steps after "upload", located by "id" when they have one.
+
+WHAT TO TEST FOR EACH COMPONENT - write the checks that apply to the component and that the executor can verify:
+- Form: visible, submit with all fields valid, submit with all fields empty.
+- Every field: its label or input is visible and accepts a valid value.
+- Required field: left empty while the other fields are valid.
+- email: valid address, no "@", no domain, spaces only, very long address.
+- password: valid, too short, wrong value, spaces only, very long; if there is a confirm field, matching and mismatching values.
+- text, search, textarea: normal, spaces only, special characters, Unicode, very long, SQL injection string, script tag.
+- tel, number, date, url: valid, wrong format, and values just inside and just outside any limit.
+- "maxlength", "minlength", "min", "max" or "pattern" in the crawl data: test at the limit and just past it. Never assume a limit the crawl data does not show.
+- select: each real option. radio: each choice. checkbox: ticked and unticked.
+- Button: visible, and clicking it produces its visible result.
+- Toggle or tab: clicking it shows the form or section it opens.
+- Link (from "clickable_links"): clicking it leads to a visible result. Locate it by its text, e.g. xpath //a[normalize-space()='About'].
+- Heading (from "text_headings"): the text is visible.
+
+HOW MANY TEST CASES:
+- Generate as many distinct test cases as the components justify, up to a maximum of {max_cases} in total.
+- A page with many components should get close to {max_cases}. A small page gets fewer.
+- NEVER pad: no two test cases may check the same behaviour of the same component with equivalent input.
+- If there are more possible checks than the maximum, keep the ones that serve the user story and those with Critical or High priority.
+
 WHAT THE EXECUTOR CAN DO — a test that needs anything else cannot be run, so do not write it:
-- The only actions are "navigate", "input", "click" and "assert". There is no hover, key press, focus check, wait or timing.
+- The only actions are "navigate", "input", "upload", "click" and "assert".
+- "upload" puts generated sample files into the page's file field. Leave out "locator" unless the page has several file fields. Optional: "files" (1-5, default 1) and "file_type" ("jpg", "png", "pdf", "txt" or "csv"; default is an accepted type). It cannot make other types.
+- A "click" or "assert" step that must wait for processing takes "wait": seconds (up to 90). Give the first click after an upload "wait": 60.
+- "assert" with "type": "download" checks that a file was downloaded; "expected" is its extension, e.g. ".pdf".
+- "assert" with "type": "hidden" checks that the element in "locator" is not visible. There is no hover, key press, focus check, wait or timing.
 - "assert" with "type": "url" checks that the URL contains "expected".
 - "assert" with "type": "element" and a "locator" checks that the element is VISIBLE and, if "expected" is not "", that its visible text or field value contains "expected".
 - "assert" with "type": "text" and no locator checks that "expected" is visible text on the page. "expected" must be text the page really shows, never a description of behaviour.
@@ -65,18 +103,14 @@ RULES YOU MUST FOLLOW:
    - negative   → "System should BLOCK the action and show an error message"
    - edge_case  → "System should handle gracefully without crashing"
 
-3. PASS/FAIL RULE:
-   - PASS = actual behavior MATCHES expected behavior
-   - FAIL = actual behavior does NOT match expected behavior
-   - ⚠️ NEVER mark a test FAIL just because the action did not complete
-   - For NEGATIVE test cases: If system REJECTS → PASS. If system ALLOWS → FAIL.
-
-⚡ CORE PRINCIPLES (ANTIGRAVITY MODE):
-- Minimal Steps: navigate → input → click → assert. No extra steps.
+CORE PRINCIPLES:
+- Minimal Steps: navigate → input or upload → click → assert. No extra steps.
 - Deterministic Execution: Every step must be fully defined and machine-executable.
 - Fastest Locator Strategy: 1. id (fastest), 2. name, 3. css, 4. xpath (only if needed).
 - Locator Accuracy: use type "id" only with an "id" value from the crawl data, and type "name" only with a "name" value. If an element has neither, use css built from what the crawl data shows (e.g. #formId button[type='submit']).
 - Assertion Efficiency: every test ends with one assert that follows the rules above.
+- Brevity: keep titles and steps short, so that all test cases fit in one response.
+- Literal values only: JSON cannot hold code. Never write expressions such as "a".repeat(255) or "a" + "b". Type every value out in full; for a very long input, write exactly 60 characters unless the crawl data shows a larger limit.
 
 RETURN ONLY valid JSON with this exact structure:
 {
@@ -86,24 +120,20 @@ RETURN ONLY valid JSON with this exact structure:
       "component": "<Component Name>",
       "test_cases": [
         {
-          "tc_id": "TC_01",
+          "tc_id": "TC_001",
           "title": "<test case title>",
           "type": "positive | negative | edge_case",
           "test_type": "<UI|Functional|Validation|Boundary|Negative|Security>",
-          "preconditions": "<any setup needed>",
           "test_steps": ["Step 1", "Step 2"],
-          "input_data": "<what the user enters>",
           "expected_result": "<what the system SHOULD do>",
-          "pass_condition": "<when to mark this PASS>",
-          "fail_condition": "<when to mark this FAIL>",
-          "status": "NOT RUN",
           "priority": "<Critical|High|Medium|Low>",
           "page_url": "<URL>",
           "automation_steps": [
             {"action": "navigate", "url": "https://example.com/login"},
             {"action": "input", "locator": {"type": "id|name|css|xpath", "value": "username"}, "value": "user@test.com"},
-            {"action": "click", "locator": {"type": "css", "value": "button[type='submit']"}},
-            {"action": "assert", "type": "url|element|text", "locator": {"type": "id", "value": "<only for type element>"}, "expected": "<see the rules above>"}
+            {"action": "upload", "files": 1},
+            {"action": "click", "locator": {"type": "css", "value": "button[type='submit']"}, "wait": 60},
+            {"action": "assert", "type": "url|element|text|download|hidden", "locator": {"type": "id", "value": "<only for type element>"}, "expected": "<see the rules above>"}
           ],
           "mapped": true
         }
@@ -112,8 +142,17 @@ RETURN ONLY valid JSON with this exact structure:
   ]
 }
 
-Generate 15-30 test cases total across all components. Use REAL element locators exactly matching the crawl data.
-"""
+Number "tc_id" in sequence across all components. Return no more than {max_cases} test cases. Use REAL element locators exactly matching the crawl data.
+""".replace("{max_cases}", str(MAX_TEST_CASES))
+
+
+# Despite the prompt, Gemini sometimes writes a long input as JavaScript, e.g.
+# "a".repeat(255) + "@example.com", which makes the whole reply invalid JSON.
+_JS_REPEAT = re.compile(r'"([^"\\]*)"\.repeat\((\d+)\)(?:\s*\+\s*"([^"\\]*)")?')
+
+
+def _expand_repeat(m) -> str:
+    return '"' + (m[1] * min(int(m[2]), 1000))[:1000] + (m[3] or "") + '"'
 
 
 class SmartTestGeneratorAgent:
@@ -160,6 +199,8 @@ class SmartTestGeneratorAgent:
         # ── Step 4: Fallback to rule-based ──────────────────────────────
         if not test_suites:
             test_suites = self._rule_based_fallback(extraction, query, url)
+
+        test_suites = self._limit_cases(self._runnable_only(test_suites), MAX_TEST_CASES)
 
         # The executor gets a flat list, so each case needs its suite's component
         for suite in test_suites:
@@ -213,6 +254,27 @@ class SmartTestGeneratorAgent:
         return counts
 
     @staticmethod
+    def _runnable_only(suites: list) -> list:
+        """Drop cases the executor could only report as "not verified"."""
+        kept = []
+        for suite in suites:
+            cases = [tc for tc in suite.get("test_cases", []) if is_runnable(tc)]
+            if cases:
+                kept.append({**suite, "test_cases": cases})
+        return kept
+
+    @staticmethod
+    def _limit_cases(suites: list, limit: int) -> list:
+        """Keep at most `limit` cases overall, dropping emptied suites."""
+        kept = []
+        for suite in suites:
+            cases = suite.get("test_cases", [])[:limit]
+            if cases:
+                kept.append({**suite, "test_cases": cases})
+                limit -= len(cases)
+        return kept
+
+    @staticmethod
     def _group_flat_cases(cases: list) -> list:
         """Group a flat list of test cases by component."""
         groups = {}
@@ -261,7 +323,11 @@ class SmartTestGeneratorAgent:
     def _type_info(tag) -> dict:
         """Field type; for a dropdown, also the options it offers."""
         if tag.name != "select":
-            return {"type": tag.get("type", "text")}
+            field_type = tag.get("type", "text")
+            keys = ["maxlength", "minlength", "min", "max", "pattern"]
+            if field_type in ("radio", "checkbox"):
+                keys.append("value")
+            return {"type": field_type, **{k: tag.get(k) for k in keys if tag.get(k) is not None}}
         options = [
             {"value": o.get("value", o.get_text(strip=True)), "text": o.get_text(strip=True)}
             for o in tag.find_all("option") if not o.has_attr("disabled")
@@ -324,7 +390,7 @@ class SmartTestGeneratorAgent:
             "pages": [],
         }
 
-        for page in pages:
+        for index, page in enumerate(pages):
             if "error" in page:
                 continue
 
@@ -352,7 +418,11 @@ class SmartTestGeneratorAgent:
                     timeout=8, verify=False,
                     proxies=request_proxies(),
                 )
-                soup = BeautifulSoup(resp.text, "html.parser")
+                seen = look_at_page(page.get("url", "")) if index < MAX_BROWSER_PAGES else None
+                if seen:
+                    page_info["file_uploads"] = seen["file_uploads"]
+                    page_info["after_upload"] = seen["after_upload"]
+                soup = BeautifulSoup(seen["html"] if seen else resp.text, "html.parser")
                 for form_tag in soup.find_all("form"):
                     form_data = {
                         **self._locator_attrs(form_tag),
@@ -408,13 +478,14 @@ class SmartTestGeneratorAgent:
 
         raw = json.dumps(context, ensure_ascii=False, default=str)
         # Cap the size to stay within token limits
-        if len(raw) > 12000:
-            raw = raw[:12000] + "...(truncated)"
+        if len(raw) > MAX_CRAWL_CHARS:
+            raw = raw[:MAX_CRAWL_CHARS] + "...(truncated)"
         return raw
 
     def _parse_test_cases(self, raw: str):
         """Parse AI response — handles both grouped and flat formats."""
         cleaned = re.sub(r"```(?:json)?", "", raw).strip("`").strip()
+        cleaned = _JS_REPEAT.sub(_expand_repeat, cleaned)
 
         try:
             data = json.loads(cleaned)
@@ -513,8 +584,11 @@ class SmartTestGeneratorAgent:
         links = []
         for a in soup.find_all("a", href=True):
             text = a.get_text(strip=True)
-            if text and len(text) < 60 and not a["href"].startswith(("#", "javascript:")):
-                links.append({"text": text, "href": a["href"]})
+            target = urlparse(urljoin(page_url, a["href"]))
+            # A new-tab link leaves this page's URL unchanged
+            if (text and len(text) < 60 and not a["href"].startswith("#")
+                    and target.scheme in ("http", "https") and a.get("target") != "_blank"):
+                links.append({"text": text, "expected_url": target.path.rstrip("/") or target.netloc})
             if len(links) >= 15:
                 break
 
@@ -548,11 +622,17 @@ class SmartTestGeneratorAgent:
         tc_idx = 1
         feature = query or "Website Feature Testing"
 
-        for page in pages:
+        for index, page in enumerate(pages):
             if "error" in page:
                 continue
             page_url = page.get("url", url)
             comp = self._scrape_page_components(page_url)
+            seen = look_at_page(page_url) if index < MAX_BROWSER_PAGES else None
+            if seen and seen["file_uploads"]:
+                cases = self._upload_cases(tc_idx, page_url, seen)
+                if cases:
+                    suites.setdefault("File Upload", []).extend(cases)
+                    tc_idx += len(cases)
             page_title = comp.get("title", "Page")
             forms = comp.get("forms", [])
             links = comp.get("links", [])
@@ -685,22 +765,14 @@ class SmartTestGeneratorAgent:
                     nav_cases.append(self._tc2(tc_idx, "Navigation", "Functional",
                         f"Click '{link['text']}' link",
                         [f"Navigate to {page_url}", f"Click '{link['text']}' link"],
-                        "Target page loads successfully", "Medium", page_url,
+                        f"URL contains '{link['expected_url']}'", "Medium", page_url,
                         [f"Open browser and navigate to '{page_url}'.",
                          f"Find link or button with text '{link['text']}' and click().",
-                         "Assert that the page/response reflects: 'page loaded successfully'."]))
+                         f"Assert that the URL contains '{link['expected_url']}'."]))
                     tc_idx += 1
-                # UI test for navigation
-                nav_cases.append(self._tc2(tc_idx, "Navigation", "UI",
-                    "Navigation menu is visible and styled",
-                    [f"Navigate to {page_url}", "Check nav menu is visible"],
-                    "Navigation links are displayed with proper styling", "Medium", page_url,
-                    [f"Open browser and navigate to '{page_url}'.",
-                     "Assert that the page/response reflects: 'navigation menu visible'."]))
-                tc_idx += 1
                 suites.setdefault("Navigation", []).extend(nav_cases)
 
-            if len([tc for tcs in suites.values() for tc in tcs]) >= 30:
+            if len([tc for tcs in suites.values() for tc in tcs]) >= MAX_TEST_CASES:
                 break
 
         # Fallback if nothing found
@@ -717,6 +789,48 @@ class SmartTestGeneratorAgent:
             ]
 
         return [{"component": comp, "test_cases": tcs} for comp, tcs in suites.items()]
+
+    # Words on a button that runs the task on an uploaded file
+    _TASK_BUTTON = re.compile(r"\b(convert|merge|compress|split|rotate|upload|process|submit)\b", re.I)
+
+    def _upload_cases(self, idx: int, page_url: str, seen: dict) -> list:
+        """Tests that perform the whole upload task. Needs a task button among
+        the controls that appeared after the sample upload."""
+        field = seen["file_uploads"][0]
+        button = next((c for c in seen["after_upload"]
+                       if c["id"] and self._TASK_BUTTON.search(c["text"])), None)
+        if not button or not accepted_type(field["accept"]):
+            return []
+        text = button["text"]
+        extension = ".pdf" if re.search(r"\bto pdf\b", text, re.I) else ""
+        locator = {"type": "id", "value": button["id"]}
+        start = {"action": "navigate", "url": page_url}
+
+        def task(files):
+            return [start, {"action": "upload", "files": files},
+                    {"action": "click", "locator": locator, "wait": 60},
+                    {"action": "assert", "type": "download", "expected": extension}]
+
+        def case(offset, test_type, title, steps, expected, automation):
+            return self._tc2(idx + offset, "File Upload", test_type, title,
+                             steps, expected, "Critical", page_url, automation)
+
+        result = f"A {extension or 'result'} file is downloaded"
+        cases = [case(0, "Functional", f"Upload one file and click '{text}'",
+                      [f"Navigate to {page_url}", "Upload one file", f"Click '{text}'", result],
+                      result, task(1))]
+        if field["multiple"]:
+            cases.append(case(len(cases), "Functional", f"Upload two files and click '{text}'",
+                              [f"Navigate to {page_url}", "Upload two files", f"Click '{text}'", result],
+                              result, task(2)))
+        accepted = field["accept"].lower()
+        if accepted and "txt" not in accepted and "text" not in accepted:
+            blocked = f"'{text}' is not offered"
+            cases.append(case(len(cases), "Negative", "Upload a file type that is not accepted",
+                              [f"Navigate to {page_url}", "Upload a .txt file", blocked], blocked,
+                              [start, {"action": "upload", "file_type": "txt"},
+                               {"action": "assert", "type": "hidden", "locator": locator, "wait": 5}]))
+        return cases
 
     def _tc2(self, idx, component, test_type, scenario, steps, expected, priority, page_url, auto_steps):
         """Build a test case dict in the new grouped format.

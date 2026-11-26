@@ -26,10 +26,13 @@ from playwright.sync_api import (
 )
 
 from agents.text_match import has_word
+from agents.uploads import accepted_type, sample_file
 from agents.url_guard import BlockedURL, browser_options, check_url
 
 SCREENSHOTS_DIR   = Path(__file__).parent.parent / "screenshots"
 WAIT_TIMEOUT      = 5   # seconds per element wait
+MAX_STEP_WAIT     = 90  # longest "wait" a step may ask for, in seconds
+DOWNLOAD_WAIT     = 60  # seconds a download assertion waits
 PAGE_LOAD_TIMEOUT = 30  # seconds per page load (hard cap)
 PAGE_SETTLE_MAX   = 6   # seconds max to wait for document ready + DOM quiet
 CLICK_SETTLE_MAX  = 3   # seconds max to wait after a click
@@ -219,6 +222,23 @@ def _is_negative_tc(tc: dict) -> bool:
     return False
 
 
+def is_runnable(tc: dict) -> bool:
+    """False for a test whose steps use an action the executor lacks, or that
+    expects something it cannot check."""
+    steps = tc.get("automation_steps") or []
+    for step in steps:
+        if isinstance(step, dict):
+            if str(step.get("action", "")).lower() not in (
+                    "navigate", "input", "upload", "click", "assert"):
+                return False
+        elif re.match(r"\s*assert", str(step), re.I):
+            quoted = re.search(r"'(.*)'", str(step))
+            text = quoted.group(1).lower() if quoted else str(step).lower()
+            if any(p in text for p in _UNVERIFIABLE_PHRASES) and not _GENERIC_ERROR_PAT.search(text):
+                return False
+    return bool(steps)
+
+
 def _purge_screenshots(directory: Path) -> None:
     """Delete screenshots older than SCREENSHOT_TTL."""
     cutoff = time.time() - SCREENSHOT_TTL
@@ -253,7 +273,7 @@ _ENTER_FIELD_PAT = re.compile(
 )
 # Regex: click/click the/find button with text 'X'
 _CLICK_PAT = re.compile(
-    r"""(?:click|find\s+(?:link|button|element)(?:\s+with\s+text)?)\s+['"]([^'"]+)['"]""",
+    r"""(?:click|find\s+(?:link\s+or\s+button|link|button|element)(?:\s+with\s+text)?)\s+['"]([^'"]+)['"]""",
     re.I,
 )
 # Regex: navigate to 'url' or navigate to url
@@ -331,6 +351,18 @@ class TestExecutorAgent:
     @_alert_texts.setter
     def _alert_texts(self, value: List[str]) -> None:
         self._tls.alert_texts = value
+
+    @property
+    def _click_notes(self) -> List[str]:
+        if not hasattr(self._tls, "click_notes"):
+            self._tls.click_notes = []
+        return self._tls.click_notes
+
+    @property
+    def _downloads(self) -> list:
+        if not hasattr(self._tls, "downloads"):
+            self._tls.downloads = []
+        return self._tls.downloads
 
     @property
     def _unverified(self) -> List[str]:
@@ -572,6 +604,7 @@ class TestExecutorAgent:
         context.set_default_timeout(WAIT_TIMEOUT * 1000)
         page = context.new_page()
         page.on("dialog", self._handle_dialog)
+        page.on("download", lambda download: self._downloads.append(download))
         return page
 
     def _handle_dialog(self, dialog) -> None:
@@ -633,6 +666,57 @@ class TestExecutorAgent:
         """Called by every click handler: let the page react."""
         page.wait_for_timeout(100)
         self._wait_for_page(page, CLICK_SETTLE_MAX)
+
+    def _observe_click(self, page: Page, do_click) -> None:
+        """Run a click and note what it did. Raises AssertionError if it led
+        to a missing page (404, 410) or a server error."""
+        url_before = page.url
+        lines_before = set(self._visible_text(page).splitlines())
+        alerts_before = len(self._alert_texts)
+        pages, loads = [], []
+
+        def on_page(new_page):
+            pages.append(new_page)
+
+        def on_response(response):
+            try:
+                request = response.request
+                if request.is_navigation_request() and request.frame.parent_frame is None:
+                    loads.append((response.status, response.url))
+            except PlaywrightError:
+                pass
+
+        page.context.on("page", on_page)
+        page.context.on("response", on_response)
+        try:
+            do_click()
+            self._after_click(page)
+            for new_page in pages:
+                self._wait_for_page(new_page, CLICK_SETTLE_MAX)
+        finally:
+            page.context.remove_listener("page", on_page)
+            page.context.remove_listener("response", on_response)
+
+        seen = [f"opened a new tab: {p.url}" for p in pages]
+        seen += [f"showed an alert: '{t}'" for t in self._alert_texts[alerts_before:]]
+        if page.url != url_before:
+            seen.append(f"went to {page.url} (title: '{page.title()}')")
+        else:
+            added = [line.strip() for line in self._visible_text(page).splitlines()
+                     if line.strip() and line not in lines_before]
+            if added:
+                seen.append(f"new text appeared: '{' | '.join(added[:3])[:150]}'")
+        self._click_notes.append(
+            "After click: " + ("; ".join(seen) or "no new URL, tab, alert or text was detected"))
+
+        # 3xx redirects are followed, so only the last page loaded counts
+        for status, url in [x for x in loads if not 300 <= x[0] < 400][-1:]:
+            assert status not in (404, 410) and status < 500, \
+                f"Click led to HTTP {status}: {url}"
+
+    def _log_click_notes(self, log_lines: List[str]) -> None:
+        log_lines += [f"   → {note}" for note in self._click_notes]
+        self._click_notes.clear()
 
     @staticmethod
     def _click(el: Locator, timeout: float = 2000) -> None:
@@ -720,6 +804,8 @@ class TestExecutorAgent:
         self._fill_log = []     # reset per-TC state
         self._alert_texts = []
         self._unverified = []
+        self._click_notes.clear()
+        self._downloads.clear()
         executed = 0
         start = time.time()
 
@@ -840,6 +926,7 @@ class TestExecutorAgent:
                             continue
                         kind = self._run_step(s, page)
                         log_lines.append(f"✔ Step {i}: {s[:90]}")
+                    self._log_click_notes(log_lines)
                     executed += 1
 
                     # A click / navigation can land on a CAPTCHA (e.g. after submit)
@@ -853,6 +940,7 @@ class TestExecutorAgent:
                     self._unverified.append(f"step {i}: {exc}")
                     log_lines.append(f"⚠ Step {i} NOT VERIFIED: {exc}")
                 except (AssertionError, PlaywrightError) as exc:
+                    self._log_click_notes(log_lines)
 
                     # 1. Blocked Action (e.g. Disabled submit button)
                     if is_negative and isinstance(exc, ElementBlocked):
@@ -1206,6 +1294,9 @@ class TestExecutorAgent:
         ltype = locator.get("type", "").lower()
         lval = locator.get("value", "")
 
+        # Slow tasks (processing an upload) need longer than WAIT_TIMEOUT
+        wait = min(float(step.get("wait") or 0), MAX_STEP_WAIT)
+
         def _get_element() -> Optional[Locator]:
             if not lval: return None
             selectors = {
@@ -1217,8 +1308,15 @@ class TestExecutorAgent:
             if ltype not in selectors:
                 return self._find_input(page, lval)
             el = page.locator(selectors[ltype]).first
-            el.wait_for(state="attached")
+            if wait:
+                el.wait_for(state="visible", timeout=wait * 1000)
+            else:
+                el.wait_for(state="attached")
             return el
+
+        if action == "upload":
+            self._upload(page, step, _get_element())
+            return
 
         if action == "input":
             value = step.get("value", "")
@@ -1237,18 +1335,26 @@ class TestExecutorAgent:
 
         if action == "click":
             el = _get_element()
-            if el:
-                self._click(el, WAIT_TIMEOUT * 1000)
-            else:
-                # If no strict locator, try smart click with 'value'
-                self._smart_click(page, step.get("value", ""))
-            self._after_click(page)
+            # With no strict locator, try smart click with 'value'
+            self._observe_click(page, lambda: self._click(el, WAIT_TIMEOUT * 1000)
+                                if el else self._smart_click(page, step.get("value", "")))
             return
 
         if action == "assert":
             atype = step.get("type", "url")
             expected = (step.get("expected") or "").strip()
-            if atype == "url":
+            if atype == "download":
+                self._assert_download(page, expected)
+            elif atype == "hidden":
+                if not lval:
+                    raise StepNotVerified("hidden assertion has no locator")
+                page.wait_for_timeout(wait * 1000 or 1000)
+                found = page.locator(
+                    {"id": f'[id="{_css_string(lval)}"]', "name": f'[name="{_css_string(lval)}"]',
+                     "xpath": f"xpath={lval}"}.get(ltype, f"css={lval}"))
+                assert not any(_is_shown(e) for e in found.all()), \
+                    f"Element '{lval}' is visible but should not be"
+            elif atype == "url":
                 if not expected:
                     raise StepNotVerified("URL assertion has no expected value")
                 cur = page.url
@@ -1260,13 +1366,56 @@ class TestExecutorAgent:
                     raise AssertionError(f"Element '{lval}' not found")
                 self._assert_element(page, el, lval, expected)
             elif expected:
+                deadline = time.time() + wait
                 src = self._visible_text(page)
+                while expected.lower() not in src and time.time() < deadline:
+                    page.wait_for_timeout(500)
+                    src = self._visible_text(page)
                 assert expected.lower() in src, f"Text '{expected}' not found on page"
             else:
                 raise StepNotVerified("assertion has nothing to check")
             return
 
         raise StepNotVerified(f"unsupported action '{action}'")
+
+    def _upload(self, page: Page, step: dict, el: Optional[Locator]) -> None:
+        """Put sample files into a file field. The files are generated here;
+        nothing is read from the server's disk."""
+        if el is None:
+            el = page.locator("input[type='file']").first
+            try:
+                el.wait_for(state="attached")
+            except PlaywrightError:
+                raise ElementNotFound("The page has no file upload field")
+        accept = el.get_attribute("accept") or ""
+        kind = (step.get("file_type") or "").lower().lstrip(".") or accepted_type(accept)
+        if kind and accepted_type(f".{kind}") != kind:
+            kind = None
+        if not kind:
+            raise StepNotVerified(
+                f"cannot create a sample file for '{step.get('file_type') or accept}'")
+        count = max(1, min(int(step.get("files") or 1), 5))
+        files = [sample_file(page.context, kind, n + 1) for n in range(count)]
+        el.set_input_files(files)
+        self._after_click(page)
+        self._click_notes.append("uploaded " + ", ".join(f["name"] for f in files))
+
+    def _assert_download(self, page: Page, expected: str) -> None:
+        """A non-empty file must have been downloaded during this test, with the
+        expected extension if one is given."""
+        deadline = time.time() + DOWNLOAD_WAIT
+        while not self._downloads and time.time() < deadline:
+            page.wait_for_timeout(500)
+        assert self._downloads, f"No file was downloaded within {DOWNLOAD_WAIT}s"
+        download = self._downloads[-1]
+        name = download.suggested_filename
+        data = Path(download.path()).read_bytes()
+        assert data, f"Downloaded file '{name}' is empty"
+        assert name.lower().endswith(expected.lower()), \
+            f"Downloaded '{name}', expected a '{expected}' file"
+        if expected.lower() == ".pdf":
+            assert data.startswith(b"%PDF"), f"Downloaded '{name}' is not a real PDF"
+        self._click_notes.append(f"downloaded '{name}' ({len(data)} bytes)")
 
     @staticmethod
     def _assert_element(page: Page, el: Locator, name: str, expected: str) -> None:
@@ -1340,8 +1489,7 @@ class TestExecutorAgent:
         click_m = _CLICK_PAT.search(s)
         if click_m:
             target = click_m.group(1).strip()
-            self._smart_click(page, target)
-            self._after_click(page)
+            self._observe_click(page, lambda: self._smart_click(page, target))
             return "click"
 
         # ── Assert URL ──────────────────────────────────────────────────
